@@ -1,0 +1,128 @@
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v23.3.8
+    container_name: ulpf-redpanda
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --overprovisioned
+      - --node-id=0
+      - --kafka-addr
+      - PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
+      - --advertise-kafka-addr
+      - PLAINTEXT://redpanda:29092,OUTSIDE://localhost:9092
+    ports:
+      - "9092:9092"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  opensearch:
+    image: opensearchproject/opensearch:2.11.0
+    container_name: ulpf-opensearch
+    environment:
+      discovery.type: single-node
+      plugins.security.disabled: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  syslog_collector:
+    build:
+      context: .
+      dockerfile: collectors/syslog_collector/Dockerfile
+    container_name: ulpf-syslog-collector
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      REDPANDA_BROKER: redpanda:29092
+      RAW_TOPIC: logs.raw
+      COLLECTOR_ID: syslog-collector-1
+      SYSLOG_PORT: 1514
+    ports:
+      - "1514:1514/udp"
+    restart: on-failure
+
+  http_json_collector:
+    build:
+      context: .
+      dockerfile: collectors/http_json_collector/Dockerfile
+    container_name: ulpf-http-json-collector
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      REDPANDA_BROKER: redpanda:29092
+      RAW_TOPIC: logs.raw
+      COLLECTOR_ID: http-json-collector-1
+      HTTP_PORT: 8081
+    ports:
+      - "8081:8081"
+    restart: on-failure
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: orchestrator/Dockerfile
+    container_name: ulpf-orchestrator
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    environment:
+      REDPANDA_BROKER: redpanda:29092
+      RAW_TOPIC: logs.raw
+      NORMALIZED_TOPIC: logs.normalized
+      DLQ_TOPIC: logs.dlq
+      OPENSEARCH_URL: http://opensearch:9200
+      SILVER_INDEX: ulpf-silver
+      DLQ_INDEX: ulpf-dlq
+    restart: on-failure
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: ulpf-api
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    environment:
+      OPENSEARCH_URL: http://opensearch:9200
+      SILVER_INDEX: ulpf-silver
+      DLQ_INDEX: ulpf-dlq
+    ports:
+      - "8000:8000"
+    restart: on-failure
+
+  ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    container_name: ulpf-ui
+    depends_on:
+      - api
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    restart: on-failure
+
+volumes:
+  redpanda-data:
+  opensearch-data:
