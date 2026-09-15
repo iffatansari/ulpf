@@ -20,13 +20,18 @@ A containerized framework for collecting logs from different sources, processing
 git clone https://github.com/iffatansari/ulpf.git
 cd ulpf
 
+### Run
 
-Run
+```bash
 docker compose up --build -d
-Check
+
+### Check
+
+```bash
 docker compose ps
 
-All services should be Up. Redpanda and OpenSearch should show Healthy.
+
+#### All services should be Up. Redpanda and OpenSearch should show Healthy.
 
 Access
 Service	URL
