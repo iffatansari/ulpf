@@ -14,30 +14,30 @@ A containerized framework for collecting logs from different sources, processing
 - Git
 - Docker Desktop
 
-### Clone
+### 1. Clone
 
 ```bash
 git clone https://github.com/iffatansari/ulpf.git
 cd ulpf
+```
 
-### Run
+### 2. Start ULPF - Run
 
 ```bash
 docker compose up --build -d
+```
 
-### Check
+### 3. Check the services
 
 ```bash
 docker compose ps
+```
+####All services should be Up. Redpanda and OpenSearch should show Healthy.
 
-
-#### All services should be Up. Redpanda and OpenSearch should show Healthy.
-
-Access
-Service	URL
-ULPF UI	http://localhost:3000
-API	http://localhost:8000
-HTTP Collector	http://localhost:8081
+### 4. Open the applications
+UI: http://localhost:3000
+API: http://localhost:8000
+HTTP Log Collector: http://localhost:8081
 
 ULPF is ready to use.
 
