@@ -1,3 +1,4 @@
 aiokafka
+python-snappy
 opensearch-py
 pydantic

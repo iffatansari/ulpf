@@ -23,6 +23,8 @@ async def send_raw_event(
     transport: str,
     format_hint: Optional[str],
 ):
+    print("STEP 1: Creating RawEventEnvelope", flush=True)
+
     event = RawEventEnvelope(
         event_id=str(uuid.uuid4()),
         source_id=source_id,
@@ -33,12 +35,14 @@ async def send_raw_event(
         collector_id=COLLECTOR_ID,
     )
 
-    await producer.send_and_wait(
+    print("STEP 2: Sending to Redpanda", flush=True)
+
+    result = await producer.send_and_wait(
         RAW_TOPIC,
-        json.dumps(event.dict()).encode("utf-8"),
+        json.dumps(event.model_dump(mode="json")).encode("utf-8"),
     )
 
-
+    print(f"STEP 3: Sent to {RAW_TOPIC}: {event.event_id} | {result}", flush=True)
 async def syslog_server(producer: AIOKafkaProducer):
     import socket
 
@@ -59,6 +63,9 @@ async def syslog_server(producer: AIOKafkaProducer):
         try:
             data, addr = sock.recvfrom(65535)
             line = data.decode("utf-8", errors="replace")
+
+            print(f"RECEIVED: {line} from {addr}", flush=True)
+
 
             await send_raw_event(
                 producer,

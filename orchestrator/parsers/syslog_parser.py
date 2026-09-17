@@ -7,7 +7,8 @@ from schema.normalized_event import NormalizedEvent
 
 # Very simple BSD syslog parser for MVP (RFC 3164-like)
 SYSLOG_PATTERN = re.compile(
-    r"^(?P<timestamp>\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+"
+    r"^(?:<(?P<pri>\d{1,3})>)?"
+    r"(?P<timestamp>\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+"
     r"(?P<host>\S+)\s+"
     r"(?P<program>[^:]+):\s+"
     r"(?P<message>.*)$"
