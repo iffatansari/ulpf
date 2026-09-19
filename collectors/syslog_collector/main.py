@@ -1,8 +1,8 @@
 import asyncio
 import json
 import os
+import re
 import uuid
-from typing import Optional
 
 from aiokafka import AIOKafkaProducer
 
@@ -15,15 +15,43 @@ COLLECTOR_ID = os.getenv("COLLECTOR_ID", "syslog-collector-1")
 SYSLOG_PORT = int(os.getenv("SYSLOG_PORT", "1514"))
 
 
+def detect_log_format(line: str) -> str:
+    """
+    Detect the format of a UDP log payload.
+
+    Important:
+    UDP transport does NOT automatically mean the payload is Syslog.
+    We only label the payload when we have a recognizable signature.
+    """
+
+    line = line.strip()
+
+    # CEF logs have a very strong signature.
+    if line.startswith("CEF:"):
+        return "cef"
+
+    # RFC-style Syslog normally begins with a PRI value such as <34>.
+    # Example:
+    # <34>Sep 19 12:20:00 server1 sshd: Accepted login
+    if re.match(r"^<\d{1,3}>", line):
+        return "syslog"
+
+    # We don't know the format yet.
+    return "unknown"
+
+
 async def send_raw_event(
-    producer: AIOKafkaProducer,
-    raw_line: str,
-    source_id: str,
-    source_type: str,
-    transport: str,
-    format_hint: Optional[str],
+    producer,
+    raw_line,
+    source_id,
+    source_type,
+    transport,
+    format_hint,
 ):
-    print("STEP 1: Creating RawEventEnvelope", flush=True)
+    print(
+        "STEP 1: Creating RawEventEnvelope",
+        flush=True,
+    )
 
     event = RawEventEnvelope(
         event_id=str(uuid.uuid4()),
@@ -35,52 +63,93 @@ async def send_raw_event(
         collector_id=COLLECTOR_ID,
     )
 
-    print("STEP 2: Sending to Redpanda", flush=True)
+    print(
+        f"Detected format: {format_hint}",
+        flush=True,
+    )
+
+    print(
+        "STEP 2: Sending to Redpanda",
+        flush=True,
+    )
 
     result = await producer.send_and_wait(
         RAW_TOPIC,
-        json.dumps(event.model_dump(mode="json")).encode("utf-8"),
+        json.dumps(
+            event.model_dump(mode="json")
+        ).encode("utf-8"),
     )
 
-    print(f"STEP 3: Sent to {RAW_TOPIC}: {event.event_id} | {result}", flush=True)
-async def syslog_server(producer: AIOKafkaProducer):
+    print(
+        f"STEP 3: Sent to {RAW_TOPIC}: "
+        f"{event.event_id} | {result}",
+        flush=True,
+    )
+
+
+async def syslog_server(producer):
     import socket
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("0.0.0.0", SYSLOG_PORT))
+    sock = socket.socket(
+        socket.AF_INET,
+        socket.SOCK_DGRAM,
+    )
+
+    sock.setsockopt(
+        socket.SOL_SOCKET,
+        socket.SO_REUSEADDR,
+        1,
+    )
+
+    sock.bind(
+        ("0.0.0.0", SYSLOG_PORT)
+    )
+
     sock.setblocking(False)
 
     default_source_id = "syslog-source-1"
     default_source_type = "server"
-    default_format_hint = "syslog"
 
-    print(f"Syslog collector listening on UDP {SYSLOG_PORT}")
+    print(
+        f"Syslog collector listening on UDP {SYSLOG_PORT}",
+        flush=True,
+    )
 
     while True:
         await asyncio.sleep(0)
 
         try:
             data, addr = sock.recvfrom(65535)
-            line = data.decode("utf-8", errors="replace")
 
-            print(f"RECEIVED: {line} from {addr}", flush=True)
+            line = data.decode(
+                "utf-8",
+                errors="replace",
+            ).strip()
 
+            print(
+                f"RECEIVED: {line} from {addr}",
+                flush=True,
+            )
+
+            detected_format = detect_log_format(line)
 
             await send_raw_event(
                 producer,
                 line,
                 source_id=default_source_id,
                 source_type=default_source_type,
-                transport="syslog",
-                format_hint=default_format_hint,
+                transport="udp",
+                format_hint=detected_format,
             )
 
         except BlockingIOError:
             continue
 
         except Exception as exc:
-            print(f"Syslog collector error: {exc}")
+            print(
+                f"Syslog collector error: {exc}",
+                flush=True,
+            )
 
 
 async def main():
@@ -92,6 +161,7 @@ async def main():
 
     try:
         await syslog_server(producer)
+
     finally:
         await producer.stop()
 

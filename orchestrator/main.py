@@ -1,46 +1,230 @@
 import asyncio
 import json
 import os
+import uuid
 from typing import Optional
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from opensearchpy import OpenSearch
+
 from schema.raw_event import RawEventEnvelope
 from schema.normalized_event import NormalizedEvent
+from schema.dlq_record import DLQRecord
 
+from parsers.cef_parser import parse_cef_log
 from parsers.json_parser import parse_json_log
 from parsers.syslog_parser import parse_syslog
 
 
 REDPANDA_BROKER = os.getenv("REDPANDA_BROKER", "redpanda:29092")
+
 RAW_TOPIC = os.getenv("RAW_TOPIC", "logs.raw")
 NORMALIZED_TOPIC = os.getenv("NORMALIZED_TOPIC", "logs.normalized")
+DLQ_TOPIC = os.getenv("DLQ_TOPIC", "logs.dlq")
+
 OPENSEARCH_URL = os.getenv("OPENSEARCH_URL", "http://opensearch:9200")
+
 SILVER_INDEX = os.getenv("SILVER_INDEX", "ulpf-silver")
+DLQ_INDEX = os.getenv("DLQ_INDEX", "ulpf-dlq")
 
 GROUP_ID = "ulpf-orchestrator-group"
 
 
-def normalize_raw_event(raw_event: RawEventEnvelope) -> Optional[NormalizedEvent]:
-    if raw_event.transport == "syslog" or raw_event.format_hint == "syslog":
-        parser = parse_syslog
-    elif raw_event.transport == "http_json" or raw_event.format_hint == "json":
-        parser = parse_json_log
+def try_parser(
+    parser,
+    parser_id: str,
+    raw_event: RawEventEnvelope,
+):
+    """
+    Try one parser against the raw event.
+
+    Returns:
+        (NormalizedEvent or None, parser_id)
+    """
+
+    try:
+        parsed = parser(
+            raw_event.raw_payload,
+            raw_event.event_id,
+            raw_event.source_id,
+        )
+
+        if parsed is None:
+            return None, parser_id
+
+        normalized = NormalizedEvent.model_validate(
+            parsed.model_dump()
+        )
+
+        return normalized, parser_id
+
+    except Exception as exc:
+        print(
+            f"Parser {parser_id} failed for "
+            f"{raw_event.event_id}: {exc}",
+            flush=True,
+        )
+
+        return None, parser_id
+
+
+def normalize_raw_event(
+    raw_event: RawEventEnvelope,
+) -> tuple[Optional[NormalizedEvent], list[str]]:
+    """
+    Decide which parser(s) should be tried.
+
+    Known format:
+        Use the corresponding parser.
+
+    Unknown format:
+        Probe all known parsers until one successfully
+        produces a valid NormalizedEvent.
+    """
+
+    parsers_attempted = []
+
+    # ---------------------------------------------------------
+    # 1. CEF explicitly identified
+    # ---------------------------------------------------------
+    if raw_event.format_hint == "cef":
+
+        normalized, parser_id = try_parser(
+            parse_cef_log,
+            "cef-parser-v1",
+            raw_event,
+        )
+
+        parsers_attempted.append(parser_id)
+
+        if normalized is not None:
+            return normalized, parsers_attempted
+
+        return None, parsers_attempted
+
+    # ---------------------------------------------------------
+    # 2. JSON explicitly identified
+    # ---------------------------------------------------------
+    if raw_event.format_hint == "json":
+
+        normalized, parser_id = try_parser(
+            parse_json_log,
+            "json-parser-v1",
+            raw_event,
+        )
+
+        parsers_attempted.append(parser_id)
+
+        if normalized is not None:
+            return normalized, parsers_attempted
+
+        return None, parsers_attempted
+
+    # ---------------------------------------------------------
+    # 3. Syslog explicitly identified
+    # ---------------------------------------------------------
+    if raw_event.format_hint == "syslog":
+
+        normalized, parser_id = try_parser(
+            parse_syslog,
+            "syslog-parser-v1",
+            raw_event,
+        )
+
+        parsers_attempted.append(parser_id)
+
+        if normalized is not None:
+            return normalized, parsers_attempted
+
+        return None, parsers_attempted
+
+    # ---------------------------------------------------------
+    # 4. UNKNOWN FORMAT
+    #
+    # Do NOT use transport to decide the parser.
+    #
+    # Probe all known parsers.
+    # ---------------------------------------------------------
+    if raw_event.format_hint == "unknown":
+
+        candidate_parsers = [
+            ("cef-parser-v1", parse_cef_log),
+            ("json-parser-v1", parse_json_log),
+            ("syslog-parser-v1", parse_syslog),
+        ]
+
+        for parser_id, parser in candidate_parsers:
+
+            normalized, attempted_parser_id = try_parser(
+                parser,
+                parser_id,
+                raw_event,
+            )
+
+            parsers_attempted.append(attempted_parser_id)
+
+            if normalized is not None:
+
+                print(
+                    f"Unknown format identified as "
+                    f"{parser_id} for event "
+                    f"{raw_event.event_id}",
+                    flush=True,
+                )
+
+                return normalized, parsers_attempted
+
+        # None of the known parsers could understand it.
+        return None, parsers_attempted
+
+    # ---------------------------------------------------------
+    # 5. No usable format hint
+    # ---------------------------------------------------------
+
+    return None, parsers_attempted
+
+
+def create_dlq_record(
+    raw_event: RawEventEnvelope,
+    parsers_attempted: list[str],
+) -> DLQRecord:
+
+    # Unknown format where every known parser failed.
+    if raw_event.format_hint == "unknown":
+
+        classification = "format_unidentified"
+        status = "unknown"
+
+    # Known format but its parser could not parse it.
+    elif parsers_attempted:
+
+        classification = "no_parser_match"
+        status = "parse_failure"
+
+    # Nothing was available to identify/parse it.
     else:
-        return None
 
-    parsed = parser(
-        raw_event.raw_payload,
-        raw_event.event_id,
-        raw_event.source_id,
+        classification = "unsupported_format"
+        status = "unknown"
+
+    return DLQRecord(
+        dlq_id=str(uuid.uuid4()),
+        raw_event_id=raw_event.event_id,
+        raw_payload=raw_event.raw_payload,
+        parsers_attempted=parsers_attempted,
+        status=status,
+        classification=classification,
+        metadata={
+            "source_id": raw_event.source_id,
+            "source_type": raw_event.source_type,
+            "transport": raw_event.transport,
+            "format_hint": raw_event.format_hint,
+        },
     )
-    if parsed is None:
-        return None
-
-    return NormalizedEvent.model_validate(parsed.model_dump())
 
 
 async def main():
+
     consumer = AIOKafkaConsumer(
         RAW_TOPIC,
         bootstrap_servers=REDPANDA_BROKER,
@@ -49,45 +233,116 @@ async def main():
         enable_auto_commit=True,
         value_deserializer=lambda v: v.decode("utf-8"),
     )
-    producer = AIOKafkaProducer(bootstrap_servers=REDPANDA_BROKER)
-    opensearch = OpenSearch(hosts=[OPENSEARCH_URL], timeout=10)
+
+    producer = AIOKafkaProducer(
+        bootstrap_servers=REDPANDA_BROKER
+    )
+
+    opensearch = OpenSearch(
+        hosts=[OPENSEARCH_URL],
+        timeout=10,
+    )
 
     await consumer.start()
     await producer.start()
 
+    print(
+        f"Orchestrator started. Reading {RAW_TOPIC}",
+        flush=True,
+    )
+
     try:
+
         async for msg in consumer:
-            raw_json = json.loads(msg.value)
-            raw_event = RawEventEnvelope(**raw_json)
-            normalized = normalize_raw_event(raw_event)
-            if normalized is None:
-                if raw_event.transport == "syslog" or raw_event.format_hint == "syslog":
-                    parser_name = "syslog"
-                elif raw_event.transport == "http_json" or raw_event.format_hint == "json":
-                    parser_name = "json"
-                else:
-                    parser_name = "none"
+
+            try:
+                raw_json = json.loads(msg.value)
+
+                raw_event = RawEventEnvelope(
+                    **raw_json
+                )
+
+                normalized, parsers_attempted = normalize_raw_event(
+                    raw_event
+                )
+
+                # -------------------------------------------------
+                # SUCCESS → Normalized pipeline
+                # -------------------------------------------------
+
+                if normalized is not None:
+
+                    normalized_document = normalized.model_dump(
+                        mode="json"
+                    )
+
+                    await producer.send_and_wait(
+                        NORMALIZED_TOPIC,
+                        json.dumps(
+                            normalized_document
+                        ).encode("utf-8"),
+                    )
+
+                    opensearch.index(
+                        index=SILVER_INDEX,
+                        id=normalized.event_id,
+                        body=normalized_document,
+                    )
+
+                    print(
+                        f"Normalized event "
+                        f"{raw_event.event_id} "
+                        f"using {normalized.parser_id}",
+                        flush=True,
+                    )
+
+                    continue
+
+                # -------------------------------------------------
+                # FAILURE → DLQ
+                # -------------------------------------------------
+
+                dlq_record = create_dlq_record(
+                    raw_event,
+                    parsers_attempted,
+                )
+
+                dlq_document = dlq_record.model_dump(
+                    mode="json"
+                )
+
+                await producer.send_and_wait(
+                    DLQ_TOPIC,
+                    json.dumps(
+                        dlq_document
+                    ).encode("utf-8"),
+                )
+
+                opensearch.index(
+                    index=DLQ_INDEX,
+                    id=dlq_record.dlq_id,
+                    body=dlq_document,
+                )
+
                 print(
-                    f"{parser_name} parser did not match event {raw_event.event_id} "
-                    f"(transport={raw_event.transport}, format_hint={raw_event.format_hint})",
+                    f"Event {raw_event.event_id} "
+                    f"sent to DLQ | "
+                    f"classification="
+                    f"{dlq_record.classification} | "
+                    f"parsers_attempted="
+                    f"{parsers_attempted}",
                     flush=True,
                 )
-                continue
 
-            normalized_document = normalized.model_dump(mode="json")
+            except Exception as exc:
 
-            await producer.send_and_wait(
-                NORMALIZED_TOPIC,
-                json.dumps(normalized_document).encode("utf-8"),
-            )
-
-            opensearch.index(
-                index=SILVER_INDEX,
-                id=normalized.event_id,
-                body=normalized_document,
-            )
+                print(
+                    f"Error processing Kafka message: {exc}",
+                    flush=True,
+                )
 
     finally:
+
         await consumer.stop()
         await producer.stop()
 
