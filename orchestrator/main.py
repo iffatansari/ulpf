@@ -2,78 +2,229 @@ import asyncio
 import json
 import os
 import uuid
-from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Optional
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from opensearchpy import OpenSearch
+
 from schema.raw_event import RawEventEnvelope
 from schema.normalized_event import NormalizedEvent
 from schema.dlq_record import DLQRecord
 
-from parsers.syslog_parser import parse_syslog
+from parsers.cef_parser import parse_cef_log
 from parsers.json_parser import parse_json_log
-# from parsers.cef_parser import parse_cef  # TODO: implement
+from parsers.syslog_parser import parse_syslog
 
 
 REDPANDA_BROKER = os.getenv("REDPANDA_BROKER", "redpanda:29092")
+
 RAW_TOPIC = os.getenv("RAW_TOPIC", "logs.raw")
 NORMALIZED_TOPIC = os.getenv("NORMALIZED_TOPIC", "logs.normalized")
 DLQ_TOPIC = os.getenv("DLQ_TOPIC", "logs.dlq")
 
+OPENSEARCH_URL = os.getenv("OPENSEARCH_URL", "http://opensearch:9200")
+
+SILVER_INDEX = os.getenv("SILVER_INDEX", "ulpf-silver")
+DLQ_INDEX = os.getenv("DLQ_INDEX", "ulpf-dlq")
+
 GROUP_ID = "ulpf-orchestrator-group"
 
 
-def parse_with_chain(raw_event: RawEventEnvelope) -> Optional[NormalizedEvent]:
+def try_parser(
+    parser,
+    parser_id: str,
+    raw_event: RawEventEnvelope,
+):
     """
-    Multi-parser chain:
-    1) Try format-specific primary parsers based on format_hint.
-    2) Try generic JSON parser.
-    3) Return None to send to DLQ.
+    Try one parser against the raw event.
+
+    Returns:
+        (NormalizedEvent or None, parser_id)
     """
-    raw = raw_event.raw_payload
-    rid = raw_event.event_id
-    source_id = raw_event.source_id
 
-    result: Optional[NormalizedEvent] = None
+    try:
+        parsed = parser(
+            raw_event.raw_payload,
+            raw_event.event_id,
+            raw_event.source_id,
+        )
 
-    # 1) Primary parsers based on hint
+        if parsed is None:
+            return None, parser_id
+
+        normalized = NormalizedEvent.model_validate(
+            parsed.model_dump()
+        )
+
+        return normalized, parser_id
+
+    except Exception as exc:
+        print(
+            f"Parser {parser_id} failed for "
+            f"{raw_event.event_id}: {exc}",
+            flush=True,
+        )
+
+        return None, parser_id
+
+
+def normalize_raw_event(
+    raw_event: RawEventEnvelope,
+) -> tuple[Optional[NormalizedEvent], list[str]]:
+    """
+    Decide which parser(s) should be tried.
+
+    Known format:
+        Use the corresponding parser.
+
+    Unknown format:
+        Probe all known parsers until one successfully
+        produces a valid NormalizedEvent.
+    """
+
+    parsers_attempted = []
+
+    # ---------------------------------------------------------
+    # 1. CEF explicitly identified
+    # ---------------------------------------------------------
+    if raw_event.format_hint == "cef":
+
+        normalized, parser_id = try_parser(
+            parse_cef_log,
+            "cef-parser-v1",
+            raw_event,
+        )
+
+        parsers_attempted.append(parser_id)
+
+        if normalized is not None:
+            return normalized, parsers_attempted
+
+        return None, parsers_attempted
+
+    # ---------------------------------------------------------
+    # 2. JSON explicitly identified
+    # ---------------------------------------------------------
+    if raw_event.format_hint == "json":
+
+        normalized, parser_id = try_parser(
+            parse_json_log,
+            "json-parser-v1",
+            raw_event,
+        )
+
+        parsers_attempted.append(parser_id)
+
+        if normalized is not None:
+            return normalized, parsers_attempted
+
+        return None, parsers_attempted
+
+    # ---------------------------------------------------------
+    # 3. Syslog explicitly identified
+    # ---------------------------------------------------------
     if raw_event.format_hint == "syslog":
-        result = parse_syslog(raw, rid, source_id)
-    elif raw_event.format_hint == "json":
-        result = parse_json_log(raw, rid, source_id)
 
-    if result:
-        return result
+        normalized, parser_id = try_parser(
+            parse_syslog,
+            "syslog-parser-v1",
+            raw_event,
+        )
 
-    # 2) Generic fallback: try JSON anyway
-    if raw_event.format_hint != "json":
-        result = parse_json_log(raw, rid, source_id)
-        if result:
-            result.parser_tier = "generic"  # type: ignore
-            result.confidence_score = 0.7   # type: ignore
-            return result
+        parsers_attempted.append(parser_id)
 
-    # 3) No parser succeeded → DLQ
-    return None
+        if normalized is not None:
+            return normalized, parsers_attempted
+
+        return None, parsers_attempted
+
+    # ---------------------------------------------------------
+    # 4. UNKNOWN FORMAT
+    #
+    # Do NOT use transport to decide the parser.
+    #
+    # Probe all known parsers.
+    # ---------------------------------------------------------
+    if raw_event.format_hint == "unknown":
+
+        candidate_parsers = [
+            ("cef-parser-v1", parse_cef_log),
+            ("json-parser-v1", parse_json_log),
+            ("syslog-parser-v1", parse_syslog),
+        ]
+
+        for parser_id, parser in candidate_parsers:
+
+            normalized, attempted_parser_id = try_parser(
+                parser,
+                parser_id,
+                raw_event,
+            )
+
+            parsers_attempted.append(attempted_parser_id)
+
+            if normalized is not None:
+
+                print(
+                    f"Unknown format identified as "
+                    f"{parser_id} for event "
+                    f"{raw_event.event_id}",
+                    flush=True,
+                )
+
+                return normalized, parsers_attempted
+
+        # None of the known parsers could understand it.
+        return None, parsers_attempted
+
+    # ---------------------------------------------------------
+    # 5. No usable format hint
+    # ---------------------------------------------------------
+
+    return None, parsers_attempted
 
 
-def build_dlq_record(raw_event: RawEventEnvelope, parsers_attempted: List[str], classification: str) -> DLQRecord:
+def create_dlq_record(
+    raw_event: RawEventEnvelope,
+    parsers_attempted: list[str],
+) -> DLQRecord:
+
+    # Unknown format where every known parser failed.
+    if raw_event.format_hint == "unknown":
+
+        classification = "format_unidentified"
+        status = "unknown"
+
+    # Known format but its parser could not parse it.
+    elif parsers_attempted:
+
+        classification = "no_parser_match"
+        status = "parse_failure"
+
+    # Nothing was available to identify/parse it.
+    else:
+
+        classification = "unsupported_format"
+        status = "unknown"
+
     return DLQRecord(
         dlq_id=str(uuid.uuid4()),
         raw_event_id=raw_event.event_id,
         raw_payload=raw_event.raw_payload,
         parsers_attempted=parsers_attempted,
-        status="parse_failure",
+        status=status,
         classification=classification,
-        reprocess_count=0,
         metadata={
             "source_id": raw_event.source_id,
+            "source_type": raw_event.source_type,
+            "transport": raw_event.transport,
             "format_hint": raw_event.format_hint,
         },
     )
 
 
 async def main():
+
     consumer = AIOKafkaConsumer(
         RAW_TOPIC,
         bootstrap_servers=REDPANDA_BROKER,
@@ -82,54 +233,116 @@ async def main():
         enable_auto_commit=True,
         value_deserializer=lambda v: v.decode("utf-8"),
     )
-    producer = AIOKafkaProducer(bootstrap_servers=REDPANDA_BROKER)
+
+    producer = AIOKafkaProducer(
+        bootstrap_servers=REDPANDA_BROKER
+    )
+
+    opensearch = OpenSearch(
+        hosts=[OPENSEARCH_URL],
+        timeout=10,
+    )
 
     await consumer.start()
     await producer.start()
 
+    print(
+        f"Orchestrator started. Reading {RAW_TOPIC}",
+        flush=True,
+    )
+
     try:
+
         async for msg in consumer:
-            raw_json = json.loads(msg.value)
-            raw_event = RawEventEnvelope(**raw_json)
 
-            parsers_attempted = []
-            norm: Optional[NormalizedEvent] = None
+            try:
+                raw_json = json.loads(msg.value)
 
-            # Run parser chain
-            if raw_event.format_hint == "syslog":
-                parsers_attempted.append("syslog-parser-v1")
-                norm = parse_syslog(raw_event.raw_payload, raw_event.event_id, raw_event.source_id)
-            elif raw_event.format_hint == "json":
-                parsers_attempted.append("json-parser-v1")
-                norm = parse_json_log(raw_event.raw_payload, raw_event.event_id, raw_event.source_id)
-
-            if not norm:
-                # Try generic JSON as fallback
-                parsers_attempted.append("generic-json-parser-v1")
-                norm = parse_json_log(raw_event.raw_payload, raw_event.event_id, raw_event.source_id)
-                if norm:
-                    norm.parser_tier = "generic"  # type: ignore
-                    norm.confidence_score = 0.7   # type: ignore
-
-            if norm:
-                # Send to normalized topic
-                await producer.send_and_wait(
-                    NORMALIZED_TOPIC,
-                    json.dumps(norm.dict(default=str)).encode("utf-8"),
+                raw_event = RawEventEnvelope(
+                    **raw_json
                 )
-            else:
-                # Send to DLQ
-                dlq = build_dlq_record(
+
+                normalized, parsers_attempted = normalize_raw_event(
+                    raw_event
+                )
+
+                # -------------------------------------------------
+                # SUCCESS → Normalized pipeline
+                # -------------------------------------------------
+
+                if normalized is not None:
+
+                    normalized_document = normalized.model_dump(
+                        mode="json"
+                    )
+
+                    await producer.send_and_wait(
+                        NORMALIZED_TOPIC,
+                        json.dumps(
+                            normalized_document
+                        ).encode("utf-8"),
+                    )
+
+                    opensearch.index(
+                        index=SILVER_INDEX,
+                        id=normalized.event_id,
+                        body=normalized_document,
+                    )
+
+                    print(
+                        f"Normalized event "
+                        f"{raw_event.event_id} "
+                        f"using {normalized.parser_id}",
+                        flush=True,
+                    )
+
+                    continue
+
+                # -------------------------------------------------
+                # FAILURE → DLQ
+                # -------------------------------------------------
+
+                dlq_record = create_dlq_record(
                     raw_event,
                     parsers_attempted,
-                    classification="no_parser_matched",
                 )
+
+                dlq_document = dlq_record.model_dump(
+                    mode="json"
+                )
+
                 await producer.send_and_wait(
                     DLQ_TOPIC,
-                    json.dumps(dlq.dict(default=str)).encode("utf-8"),
+                    json.dumps(
+                        dlq_document
+                    ).encode("utf-8"),
+                )
+
+                opensearch.index(
+                    index=DLQ_INDEX,
+                    id=dlq_record.dlq_id,
+                    body=dlq_document,
+                )
+
+                print(
+                    f"Event {raw_event.event_id} "
+                    f"sent to DLQ | "
+                    f"classification="
+                    f"{dlq_record.classification} | "
+                    f"parsers_attempted="
+                    f"{parsers_attempted}",
+                    flush=True,
+                )
+
+            except Exception as exc:
+
+                print(
+                    f"Error processing Kafka message: {exc}",
+                    flush=True,
                 )
 
     finally:
+
         await consumer.stop()
         await producer.stop()
 
