@@ -2,3 +2,4 @@ aiokafka
 python-snappy
 opensearch-py
 pydantic
+drain3

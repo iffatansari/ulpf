@@ -19,39 +19,32 @@ def detect_log_format(line: str) -> str:
     """
     Detect the format of a UDP log payload.
 
-    Important:
     UDP transport does NOT automatically mean the payload is Syslog.
-    We only label the payload when we have a recognizable signature.
     """
 
     line = line.strip()
 
-    # CEF logs have a very strong signature.
+    # CEF logs
     if line.startswith("CEF:"):
         return "cef"
 
-    # RFC-style Syslog normally begins with a PRI value such as <34>.
-    # Example:
-    # <34>Sep 19 12:20:00 server1 sshd: Accepted login
+    # RFC-style Syslog, e.g. <34>Sep 19 12:20:00 server1 sshd: login
     if re.match(r"^<\d{1,3}>", line):
         return "syslog"
 
-    # We don't know the format yet.
+    # Unknown format
     return "unknown"
 
 
 async def send_raw_event(
-    producer,
-    raw_line,
-    source_id,
-    source_type,
-    transport,
-    format_hint,
+    producer: AIOKafkaProducer,
+    raw_line: str,
+    source_id: str,
+    source_type: str,
+    transport: str,
+    format_hint: str,
 ):
-    print(
-        "STEP 1: Creating RawEventEnvelope",
-        flush=True,
-    )
+    print("STEP 1: Creating RawEventEnvelope", flush=True)
 
     event = RawEventEnvelope(
         event_id=str(uuid.uuid4()),
@@ -63,21 +56,12 @@ async def send_raw_event(
         collector_id=COLLECTOR_ID,
     )
 
-    print(
-        f"Detected format: {format_hint}",
-        flush=True,
-    )
-
-    print(
-        "STEP 2: Sending to Redpanda",
-        flush=True,
-    )
+    print(f"Detected format: {format_hint}", flush=True)
+    print("STEP 2: Sending to Redpanda", flush=True)
 
     result = await producer.send_and_wait(
         RAW_TOPIC,
-        json.dumps(
-            event.model_dump(mode="json")
-        ).encode("utf-8"),
+        json.dumps(event.model_dump(mode="json")).encode("utf-8"),
     )
 
     print(
@@ -87,69 +71,50 @@ async def send_raw_event(
     )
 
 
-async def syslog_server(producer):
-    import socket
+class SyslogUDPProtocol(asyncio.DatagramProtocol):
+    """
+    Event-driven UDP collector.
 
-    sock = socket.socket(
-        socket.AF_INET,
-        socket.SOCK_DGRAM,
-    )
+    datagram_received() is called only when a UDP packet arrives,
+    avoiding the continuous polling loop used previously.
+    """
 
-    sock.setsockopt(
-        socket.SOL_SOCKET,
-        socket.SO_REUSEADDR,
-        1,
-    )
+    def __init__(self, producer: AIOKafkaProducer):
+        self.producer = producer
+        self.default_source_id = "syslog-source-1"
+        self.default_source_type = "server"
 
-    sock.bind(
-        ("0.0.0.0", SYSLOG_PORT)
-    )
+    def datagram_received(self, data: bytes, addr) -> None:
+        line = data.decode("utf-8", errors="replace").strip()
 
-    sock.setblocking(False)
+        print(
+            f"RECEIVED: {line} from {addr}",
+            flush=True,
+        )
 
-    default_source_id = "syslog-source-1"
-    default_source_type = "server"
+        detected_format = detect_log_format(line)
 
-    print(
-        f"Syslog collector listening on UDP {SYSLOG_PORT}",
-        flush=True,
-    )
+        print(
+            f"Detected format: {detected_format}",
+            flush=True,
+        )
 
-    while True:
-        await asyncio.sleep(0)
-
-        try:
-            data, addr = sock.recvfrom(65535)
-
-            line = data.decode(
-                "utf-8",
-                errors="replace",
-            ).strip()
-
-            print(
-                f"RECEIVED: {line} from {addr}",
-                flush=True,
-            )
-
-            detected_format = detect_log_format(line)
-
-            await send_raw_event(
-                producer,
+        asyncio.ensure_future(
+            send_raw_event(
+                self.producer,
                 line,
-                source_id=default_source_id,
-                source_type=default_source_type,
+                source_id=self.default_source_id,
+                source_type=self.default_source_type,
                 transport="udp",
                 format_hint=detected_format,
             )
+        )
 
-        except BlockingIOError:
-            continue
-
-        except Exception as exc:
-            print(
-                f"Syslog collector error: {exc}",
-                flush=True,
-            )
+    def error_received(self, exc: Exception) -> None:
+        print(
+            f"Syslog collector socket error: {exc}",
+            flush=True,
+        )
 
 
 async def main():
@@ -159,10 +124,23 @@ async def main():
 
     await producer.start()
 
+    loop = asyncio.get_running_loop()
+
+    transport, _protocol = await loop.create_datagram_endpoint(
+        lambda: SyslogUDPProtocol(producer),
+        local_addr=("0.0.0.0", SYSLOG_PORT),
+    )
+
+    print(
+        f"Syslog collector listening on UDP {SYSLOG_PORT}",
+        flush=True,
+    )
+
     try:
-        await syslog_server(producer)
+        await asyncio.Event().wait()
 
     finally:
+        transport.close()
         await producer.stop()
 
 
