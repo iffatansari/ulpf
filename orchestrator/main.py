@@ -14,6 +14,7 @@ from schema.dlq_record import DLQRecord
 from parsers.cef_parser import parse_cef_log
 from parsers.json_parser import parse_json_log
 from parsers.syslog_parser import parse_syslog
+from parsers.drain_fallback import parse_drain
 
 
 REDPANDA_BROKER = os.getenv("REDPANDA_BROKER", "redpanda:29092")
@@ -174,7 +175,25 @@ def normalize_raw_event(
 
                 return normalized, parsers_attempted
 
-        # None of the known parsers could understand it.
+        normalized, attempted_parser_id = try_parser(
+            parse_drain,
+            "drain3-fallback-v1",
+            raw_event,
+        )
+
+        parsers_attempted.append(attempted_parser_id)
+
+        if normalized is not None:
+
+            print(
+                f"Unknown format identified as "
+                f"{attempted_parser_id} for event "
+                f"{raw_event.event_id}",
+                flush=True,
+            )
+
+            return normalized, parsers_attempted
+
         return None, parsers_attempted
 
     # ---------------------------------------------------------
