@@ -1,5 +1,0 @@
-fastapi
-uvicorn
-aiokafka
-opensearch-py
-pydantic

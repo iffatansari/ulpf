@@ -74,28 +74,6 @@ services:
       - "8081:8081"
     restart: on-failure
 
-  file_collector:
-    build:
-      context: .
-      dockerfile: collectors/file_collector/Dockerfile
-    container_name: ulpf-file-collector
-    depends_on:
-      redpanda:
-        condition: service_healthy
-      opensearch:
-        condition: service_healthy
-    environment:
-      REDPANDA_BROKER: redpanda:29092
-      RAW_TOPIC: logs.raw
-      COLLECTOR_ID: file-collector-1
-      FILE_PORT: 8082
-      UPLOAD_DIR: /data/uploads
-      OPENSEARCH_URL: http://opensearch:9200
-      UPLOADS_INDEX: ulpf-uploads
-    volumes:
-      - ${PWD:-.}/data/uploads:/data/uploads
-    restart: on-failure
-
   orchestrator:
     build:
       context: .
@@ -114,7 +92,6 @@ services:
       OPENSEARCH_URL: http://opensearch:9200
       SILVER_INDEX: ulpf-silver
       DLQ_INDEX: ulpf-dlq
-      BRONZE_INDEX: ulpf-bronze
     restart: on-failure
 
   api:
@@ -129,14 +106,6 @@ services:
       OPENSEARCH_URL: http://opensearch:9200
       SILVER_INDEX: ulpf-silver
       DLQ_INDEX: ulpf-dlq
-      BRONZE_INDEX: ulpf-bronze
-      SOURCES_INDEX: ulpf-sources
-      UPLOADS_INDEX: ulpf-uploads
-      UPLOAD_DIR: /data/uploads
-      FILE_COLLECTOR_URL: http://file_collector:8082
-      MAX_UPLOAD_MB: "100"
-    volumes:
-      - ${PWD:-.}/data/uploads:/data/uploads
     ports:
       - "8000:8000"
     restart: on-failure
