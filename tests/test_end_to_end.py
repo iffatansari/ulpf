@@ -7,13 +7,13 @@ def test_syslog_raw_event_is_normalized_for_silver_index():
 		event_id="raw-1",
 		source_id="syslog-source-1",
 		source_type="server",
-		transport="syslog",
+		transport="udp",
 		format_hint="syslog",
 		raw_payload="<34>Sep 16 18:40:00 test-server sshd: ULPF TEST MESSAGE",
 		collector_id="syslog-collector-1",
 	)
 
-	normalized = normalize_raw_event(raw_event)
+	normalized, _ = normalize_raw_event(raw_event)
 
 	assert normalized is not None
 	assert normalized.event_id == "raw-1-norm"

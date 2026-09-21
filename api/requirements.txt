@@ -2,3 +2,5 @@ fastapi
 uvicorn
 opensearch-py
 pydantic
+httpx
+python-multipart
