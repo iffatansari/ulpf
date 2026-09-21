@@ -114,3 +114,37 @@ def test_unknown_event_goes_to_dlq_when_drain3_fails(monkeypatch):
 		"drain3-fallback-v1",
 	]
 	assert main_module.create_dlq_record(raw_event, parsers_attempted).classification == "format_unidentified"
+
+
+def test_real_drain3_preserves_port_when_port_value_changes():
+    from orchestrator.parsers.drain_fallback import parse_drain
+
+    first = parse_drain(
+        "firewall src=10.0.0.1 dst=10.0.0.2 user=alice action=denied port=443",
+        "real-drain-1",
+        "test-source",
+    )
+
+    second = parse_drain(
+        "firewall src=10.0.0.5 dst=10.0.0.8 user=bob action=accepted port=22",
+        "real-drain-2",
+        "test-source",
+    )
+
+    assert first is not None
+    assert second is not None
+
+    assert first.parser_id == "drain3-fallback-v1"
+    assert second.parser_id == "drain3-fallback-v1"
+
+    assert first.src_endpoint == "10.0.0.1"
+    assert first.dst_endpoint == "10.0.0.2"
+    assert first.user == "alice"
+    assert first.action == "deny"
+    assert first.extensions["port"] == "443"
+
+    assert second.src_endpoint == "10.0.0.5"
+    assert second.dst_endpoint == "10.0.0.8"
+    assert second.user == "bob"
+    assert second.action == "allow"
+    assert second.extensions["port"] == "22"

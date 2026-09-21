@@ -40,6 +40,7 @@ def _build_miner() -> TemplateMiner:
         MaskingInstruction(r'(?<=dst=)(?:\d{1,3}\.){3}\d{1,3}', 'IP'),
         MaskingInstruction(r'(?<=user=)[^ ]+', 'USER'),
         MaskingInstruction(r'(?<=action=)[^ ]+', 'ACTION'),
+        MaskingInstruction(r'(?<=port=)\d{1,5}', 'PORT'),
     ]
     # Persistence intentionally left as in-memory default for the MVP:
     # templates reset on restart. Fine for a demo; swap in

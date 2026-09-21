@@ -1,36 +1,50 @@
 """
-orchestrator/parsers/field_labeling.py — Phase 2.3.
+Drain3 variable field labeling.
 
-Drain3 tells you WHERE the variable parts of a template are, never
-WHAT they mean. This module guesses the meaning, using two signals in
-priority order:
+Drain3 identifies variable positions in a log template, but it does not
+know what those variables mean. This module maps recognizable values and
+their nearby context into normalized field names.
 
-  1. The variable's own VALUE shape/content (an IP-shaped string, a
-     port-range number, a known allow/deny word). Checked FIRST and
-     wins regardless of context, because — verified while building
-     this — Drain3 can literally swallow a meaningful word like
-     "denied" into a wildcard whose surrounding template context is
-     identical to a neighboring wildcard's. If you only trusted
-     position/context, that case mislabels. Value content is what
-     rescues it.
-  2. The template TEXT immediately around the <*> placeholder (the
-     nearest real word before/after it — skipping past any adjacent
-     <*> tokens, which carry no context of their own).
-
-Anything that doesn't confidently match either signal is NOT dropped —
-it goes into `unlabeled`, which the mapper should put straight into
-NormalizedEvent.extensions. Losing data silently is worse than an
-honestly-unlabeled field.
+Priority:
+1. Recognize the value itself (IP, MAC, action word, port).
+2. Use nearby template context (user, port).
+3. Preserve anything unknown as unlabeled instead of dropping it.
 """
 
 import re
 from dataclasses import dataclass, field
 
+
 IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
 MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 
-ALLOW_WORDS = {"accepted", "accept", "allow", "allowed", "permit", "permitted"}
-DENY_WORDS = {"denied", "deny", "block", "blocked", "reject", "rejected", "drop", "dropped"}
+ALLOW_WORDS = {
+    "accepted",
+    "accept",
+    "allow",
+    "allowed",
+    "permit",
+    "permitted",
+}
+
+DENY_WORDS = {
+    "denied",
+    "deny",
+    "block",
+    "blocked",
+    "reject",
+    "rejected",
+    "drop",
+    "dropped",
+}
+
+VARIABLE_TOKENS = {
+    "<*>",
+    "<IP>",
+    "<USER>",
+    "<ACTION>",
+    "<PORT>",
+}
 
 
 @dataclass
@@ -39,16 +53,18 @@ class LabelResult:
     unlabeled: dict[str, str] = field(default_factory=dict)
 
 
-VARIABLE_TOKENS = {"<*>", "<IP>", "<USER>", "<ACTION>"}
-
-
 def _has_variable_placeholder(token: str) -> bool:
     return any(variable in token for variable in VARIABLE_TOKENS)
 
 
-def _context_words(tokens: list[str], var_index: int) -> tuple:
-    """Nearest real word before and after position var_index, skipping all masked placeholders."""
+def _context_words(tokens: list[str], var_index: int) -> tuple[str, str]:
+    """
+    Return the nearest meaningful token before and after a variable.
+
+    Drain3 placeholders are skipped.
+    """
     current_token = tokens[var_index]
+
     if "=" in current_token:
         key = current_token.split("=", 1)[0].strip(":,.").lower()
         if key:
@@ -59,72 +75,109 @@ def _context_words(tokens: list[str], var_index: int) -> tuple:
         if not _has_variable_placeholder(tokens[i]):
             before = tokens[i].strip(":,.").lower()
             break
+
     after = ""
     for i in range(var_index + 1, len(tokens)):
         if not _has_variable_placeholder(tokens[i]):
             after = tokens[i].strip(":,.").lower()
             break
+
     return before, after
+
+
+def _store_port(result: LabelResult, value: str) -> bool:
+    """
+    Recognize either:
+      443
+      port=443
+
+    Return True when the value is a valid TCP/UDP port.
+    """
+    candidate = value.strip()
+
+    if candidate.lower().startswith("port="):
+        candidate = candidate.split("=", 1)[1].strip()
+
+    if candidate.isdigit() and 0 < int(candidate) <= 65535:
+        result.labeled["port"] = candidate
+        return True
+
+    return False
 
 
 def label_variables(template: str, variables: list[str]) -> LabelResult:
     tokens = template.split()
+
     var_positions = [
-        i for i, t in enumerate(tokens) if t in VARIABLE_TOKENS or _has_variable_placeholder(t)
+        i
+        for i, token in enumerate(tokens)
+        if token in VARIABLE_TOKENS or _has_variable_placeholder(token)
     ]
 
     result = LabelResult()
-    claimed_ip_slots = ["src_ip", "dst_ip"]  # first IP found -> src, second -> dst
 
-    # Action words can end up as LITERAL template text instead of an
-    # extracted variable (verified: happens with a higher sim_th,
-    # since the word then differs enough from other lines to stay its
-    # own template rather than generalizing into <*>). Check the
-    # template's fixed tokens for this before falling through.
-    for tok in tokens:
-        tok_l = tok.strip(":,.").lower()
-        if tok_l in ALLOW_WORDS:
+    # The first two confidently recognized IPs are treated as
+    # source and destination respectively.
+    claimed_ip_slots = ["src_ip", "dst_ip"]
+
+    # Action words can become literal template tokens at a higher
+    # similarity threshold, so inspect fixed template tokens too.
+    for token in tokens:
+        token_lower = token.strip(":,.").lower()
+
+        if token_lower in ALLOW_WORDS:
             result.labeled["action"] = "allow"
-        elif tok_l in DENY_WORDS:
+
+        elif token_lower in DENY_WORDS:
             result.labeled["action"] = "deny"
 
     for idx, value in enumerate(variables):
         if idx >= len(var_positions):
-            # more extracted values than <*> tokens shouldn't happen,
-            # but don't crash the pipeline over a mismatch — bucket it
             result.unlabeled[f"var_{idx}"] = value
             continue
 
-        before, after = _context_words(tokens, var_positions[idx])
-        value_lower = value.strip().lower()
+        position = var_positions[idx]
+        before, after = _context_words(tokens, position)
+        value_clean = value.strip()
+        value_lower = value_clean.lower()
 
-        # 1) value content first
+        # 1. Value-based recognition.
         if value_lower in ALLOW_WORDS:
             result.labeled["action"] = "allow"
             continue
+
         if value_lower in DENY_WORDS:
             result.labeled["action"] = "deny"
             continue
-        if MAC_RE.match(value):
-            result.labeled.setdefault("mac", value)
+
+        if MAC_RE.match(value_clean):
+            result.labeled.setdefault("mac", value_clean)
             continue
-        if IPV4_RE.match(value):
+
+        if IPV4_RE.match(value_clean):
             slot = claimed_ip_slots.pop(0) if claimed_ip_slots else None
+
             if slot:
-                result.labeled[slot] = value
+                result.labeled[slot] = value_clean
             else:
-                result.unlabeled[f"ip_{idx}"] = value
+                result.unlabeled[f"ip_{idx}"] = value_clean
+
             continue
 
-        # 2) context word second
+        # Handles both <PORT> -> "22" and a Drain3 wildcard that
+        # captures the complete token "port=22".
+        if _store_port(result, value_clean):
+            continue
+
+        # 2. Context-based recognition.
         if before == "user" or after == "user":
-            result.labeled["user"] = value
-            continue
-        if before == "port" and value.isdigit() and 0 < int(value) <= 65535:
-            result.labeled["port"] = value
+            result.labeled["user"] = value_clean
             continue
 
-        # 3) nothing confident — keep it, just unlabeled
-        result.unlabeled[f"var_{idx}"] = value
+        if before == "port" and _store_port(result, value_clean):
+            continue
+
+        # 3. Preserve unknown values.
+        result.unlabeled[f"var_{idx}"] = value_clean
 
     return result
