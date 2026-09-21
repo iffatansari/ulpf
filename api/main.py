@@ -1,9 +1,30 @@
 import os
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from db import get_opensearch_client
+from db import (
+    DLQ_INDEX,
+    SILVER_INDEX,
+    SOURCES_INDEX,
+    UPLOADS_INDEX,
+    ensure_indices,
+    get_opensearch_client,
+)
+from routes.sources import router as sources_router
+from routes.uploads import enrich_upload_counts, router as uploads_router
+from routes.events import router as events_router
+from routes.dlq import router as dlq_router
 
-app = FastAPI(title="ULPF API")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Ensure Module 2 indices exist before the API starts serving.
+    ensure_indices()
+    yield
+
+
+app = FastAPI(title="ULPF API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -13,73 +34,47 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(sources_router)
+app.include_router(uploads_router)
+app.include_router(events_router)
+app.include_router(dlq_router)
+
 
 @app.get("/")
 def root():
     return {"service": "ulpf-api", "status": "ok"}
 
 
-@app.get("/events")
-def list_events(limit: int = Query(50, le=500)):
+@app.get("/dashboard")
+def dashboard(limit: int = Query(5, le=20)):
     """
-    List normalized events from Silver index.
-    """
-    es = get_opensearch_client()
-    index = os.getenv("SILVER_INDEX", "ulpf-silver")
-    resp = es.search(
-        index=index,
-        body={
-            "size": limit,
-            "sort": [{"time": "desc"}],
-        },
-    )
-    hits = resp["hits"]["hits"]
-    return {
-        "total": resp["hits"]["total"]["value"],
-        "events": [h["_source"] for h in hits],
-    }
-
-
-@app.get("/dlq")
-def list_dlq(limit: int = Query(50, le=500)):
-    """
-    List DLQ records.
+    High-level dashboard numbers for the ULPF UI.
+    Every value is computed directly from OpenSearch.
     """
     es = get_opensearch_client()
-    index = os.getenv("DLQ_INDEX", "ulpf-dlq")
-    resp = es.search(
-        index=index,
-        body={
-            "size": limit,
-            "sort": [{"first_seen_at": "desc"}],
-        },
-    )
-    hits = resp["hits"]["hits"]
-    return {
-        "total": resp["hits"]["total"]["value"],
-        "records": [h["_source"] for h in hits],
-    }
 
+    sources = es.count(index=SOURCES_INDEX, body={})["count"]
+    normalized = es.count(index=SILVER_INDEX, body={})["count"]
+    dlq = es.count(index=DLQ_INDEX, body={})["count"]
+    uploads = es.count(index=UPLOADS_INDEX, body={})["count"]
 
-@app.get("/sources")
-def list_sources():
-    """
-    List registered log sources (MVP: static or from a simple file/DB).
-    For now, return a static list; you can extend later.
-    """
+    recent_events = es.search(
+        index=SILVER_INDEX,
+        body={"size": limit, "sort": [{"time": "desc"}]},
+    )["hits"]["hits"]
+
+    recent_uploads = es.search(
+        index=UPLOADS_INDEX,
+        body={"size": limit, "sort": [{"created_at": "desc"}]},
+    )["hits"]["hits"]
+
     return {
-        "sources": [
-            {
-                "source_id": "syslog-source-1",
-                "source_type": "server",
-                "transport": "syslog",
-                "format_hint": "syslog",
-            },
-            {
-                "source_id": "http-json-source-1",
-                "source_type": "application",
-                "transport": "http_json",
-                "format_hint": "json",
-            },
-        ]
+        "sources": sources,
+        "normalized_events": normalized,
+        "dlq_events": dlq,
+        "uploads": uploads,
+        "recent_events": [h["_source"] for h in recent_events],
+        "recent_uploads": enrich_upload_counts(
+            [h["_source"] for h in recent_uploads]
+        ),
     }

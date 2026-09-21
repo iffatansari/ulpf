@@ -26,8 +26,87 @@ OPENSEARCH_URL = os.getenv("OPENSEARCH_URL", "http://opensearch:9200")
 
 SILVER_INDEX = os.getenv("SILVER_INDEX", "ulpf-silver")
 DLQ_INDEX = os.getenv("DLQ_INDEX", "ulpf-dlq")
+BRONZE_INDEX = os.getenv("BRONZE_INDEX", "ulpf-bronze")
 
 GROUP_ID = "ulpf-orchestrator-group"
+
+BRONZE_MAPPING = {
+    "mappings": {
+        "properties": {
+            "event_id": {"type": "keyword"},
+            "ingested_at": {"type": "date"},
+            "source_id": {"type": "keyword"},
+            "source_type": {"type": "keyword"},
+            "transport": {"type": "keyword"},
+            "format_hint": {"type": "keyword"},
+            "raw_payload": {
+                "type": "text",
+                "fields": {
+                    "keyword": {
+                        "type": "keyword",
+                        "ignore_above": 32766,
+                    }
+                },
+            },
+            "bronze_uri": {"type": "keyword"},
+            "collector_id": {"type": "keyword"},
+            "envelope_schema_version": {"type": "keyword"},
+            "upload_id": {"type": "keyword"},
+        }
+    }
+}
+
+
+# Silver/DLQ stay "dynamic" for everything except the sort fields.
+# Queries order Silver events by `time` and DLQ records by
+# `first_seen_at`; an empty index has no mapping for those, so
+# OpenSearch rejects a sort on them with a 400. Declaring the date
+# types up-front (before any document exists) fixes the fresh-start
+# crash while leaving the rest of the document dynamically mapped.
+SILVER_MAPPING = {
+    "mappings": {
+        "properties": {
+            "time": {"type": "date"},
+        }
+    }
+}
+
+DLQ_MAPPING = {
+    "mappings": {
+        "properties": {
+            "first_seen_at": {"type": "date"},
+            "last_attempt_at": {"type": "date"},
+        }
+    }
+}
+
+
+def ensure_index(es: OpenSearch, index: str, body: dict):
+    """
+    Safely create an OpenSearch index if it does not exist.
+    Does not touch an existing index.
+    """
+    if es.indices.exists(index=index):
+        return
+
+    es.indices.create(index=index, body=body)
+    print(f"Created OpenSearch index {index}", flush=True)
+
+
+def extract_upload_id(headers) -> Optional[str]:
+    """
+    Read the optional upload_id Kafka header without requiring it.
+
+    The File Collector attaches this header so a raw event can be
+    traced back to the upload job that produced it. Other collectors
+    (UDP/HTTP) do not send it and must keep working unchanged.
+    """
+    for key, value in (headers or []):
+        if key == "upload_id" and value is not None:
+            if isinstance(value, bytes):
+                return value.decode("utf-8")
+            return str(value)
+    return None
 
 
 def try_parser(
@@ -243,6 +322,10 @@ async def main():
         timeout=10,
     )
 
+    ensure_index(opensearch, BRONZE_INDEX, BRONZE_MAPPING)
+    ensure_index(opensearch, SILVER_INDEX, SILVER_MAPPING)
+    ensure_index(opensearch, DLQ_INDEX, DLQ_MAPPING)
+
     await consumer.start()
     await producer.start()
 
@@ -260,6 +343,36 @@ async def main():
 
                 raw_event = RawEventEnvelope(
                     **raw_json
+                )
+
+                # -------------------------------------------------
+                # BRONZE: persist the original raw event first.
+                #
+                # Every raw event that enters the pipeline is
+                # recorded in ulpf-bronze BEFORE any parsing is
+                # attempted. Document _id = raw_event.event_id so
+                # the normalized/DLQ raw_event_id always points
+                # back to the lossless original payload.
+                #
+                # If Bronze persistence fails, the event is not
+                # silently forwarded; the error surfaces below.
+                # -------------------------------------------------
+
+                raw_document = raw_event.model_dump(
+                    mode="json"
+                )
+
+                # File Collector attaches an upload_id Kafka header.
+                # It is stored as additive lineage metadata on the
+                # Bronze document (the envelope schema is unchanged).
+                upload_id = extract_upload_id(msg.headers)
+                if upload_id:
+                    raw_document["upload_id"] = upload_id
+
+                opensearch.index(
+                    index=BRONZE_INDEX,
+                    id=raw_event.event_id,
+                    body=raw_document,
                 )
 
                 normalized, parsers_attempted = normalize_raw_event(
