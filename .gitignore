@@ -10,3 +10,4 @@ node_modules/
 *.log
 !demo/mixed_security_logs.log
 data/
+opencode.json

@@ -35,13 +35,19 @@ Expected: all services **Up**; `opensearch` and `redpanda` **Healthy**.
 
 | Service             | Port        | Purpose                             |
 |---------------------|-------------|-------------------------------------|
-| UI                  | 3000        | Next.js dashboard                   |
+| UI                  | 3000        | React dashboard (express + normalizer + `/backend` proxy to the API) |
 | API                 | 8000        | Source Registry, uploads, events…   |
 | HTTP Log Collector  | 8081        | Module 1 HTTP ingestion             |
 | Syslog Collector    | 1514/udp    | Module 1 syslog ingestion           |
 | File Collector      | 8082 (internal) | Module 2 file processing        |
 | OpenSearch          | 9200        | bronze / silver / dlq indices       |
 | Redpanda            | 9092        | logs.raw / logs.normalized / logs.dlq|
+
+The UI page is served alongside a same-origin proxy: any `/backend/*` path on
+port 3000 is forwarded to the FastAPI service (`BACKEND_URL`, default
+`http://localhost:8000`). So the Sources / Events / DLQ / Dashboard pages read
+the real pipeline data without any CORS setup, and the UI container only needs
+a single published port.
 
 ## 4. Confirm the pipeline is healthy
 
@@ -75,6 +81,9 @@ Note the returned `source_id` (format: `<slug>-<6 hex chars>`).
 Valid `transport` values: `udp`, `http`, `file`, `other`.
 Valid `source_type` values: `network_device`, `server`, `application`,
 `database`, `cloud`, `iot`, `custom`.
+
+Remove a source with `curl -X DELETE http://localhost:8000/sources/<source_id>`
+(the UI's "Remove" button calls exactly this endpoint).
 
 ### 5.2 Upload a log file
 
@@ -116,11 +125,17 @@ curl -s "http://localhost:8000/events/<event_id>"           # event + Bronze lin
 
 Open http://localhost:3000.
 
-- **Dashboard** — pipeline health, source/event counts.
-- **Sources** — list, create, per-source detail with stats and file upload.
-- **Uploads** — live job progress (auto-refreshing).
-- **Events** — filterable list; event detail shows the Bronze raw event lineage.
-- **DLQ** — records that failed to normalize (inspect-only).
+The UI is a self-contained React SPA (Vite + Express) that ships its own
+multi-format log normalizer (`POST /api/normalize`) and runs on a single port.
+
+- **Dashboard** — quick normalize + summary.
+- **Events** — Ingest Events (paste/upload logs to normalize), Normalized Events
+  (OCSF output), DLQ (Failed Events).
+- **Sources** — Log Sources list and Add Source (format detection + parser
+  suggestions, collector snippets).
+- **Parsers** — Multi-Parser Chain config, Drain3 (unsupervised), Custom Parsers.
+- **Schema** — OCSF Schema and Schema Explorer.
+- **Monitoring** — Metrics, Logs, System Health (polls `/api/ping`).
 
 ---
 

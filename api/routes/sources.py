@@ -162,6 +162,20 @@ def update_source(source_id: str, update: SourceUpdate):
     return {"source": get_source(source_id)}
 
 
+@router.delete("/sources/{source_id}", status_code=200)
+def delete_source(source_id: str):
+    """
+    Remove one source from the Source Registry.
+    """
+    es = get_opensearch_client()
+
+    if get_source(source_id) is None:
+        raise HTTPException(status_code=404, detail=f"source not found: {source_id}")
+
+    es.delete(index=SOURCES_INDEX, id=source_id)
+    return {"deleted": source_id}
+
+
 @router.get("/sources/{source_id}/stats")
 def source_stats(source_id: str):
     """

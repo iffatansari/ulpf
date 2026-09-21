@@ -1,0 +1,97 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap");
+
+@import "tailwindcss";
+
+@config "../tailwind.config.ts";
+
+@layer base {
+  :root {
+    /* Background #FAFCFF */
+    --background: 216 2% 99%;
+    /* Text #25263A */
+    --foreground: 236 22% 19%;
+
+    /* White #FFFFFF */
+    --card: 0 0% 100%;
+    --card-foreground: 236 22% 19%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 236 22% 19%;
+
+    /* Blue #91C8FF */
+    --primary: 210 100% 78%;
+    --primary-foreground: 236 22% 19%;
+
+    /* Blue Mist #E8F4FF */
+    --secondary: 209 99% 95%;
+    --secondary-foreground: 236 22% 19%;
+
+    --muted: 209 99% 95%;
+    /* Muted #72748A */
+    --muted-foreground: 235 10% 49%;
+
+    /* Lilac Mist #F0ECFF */
+    --accent: 253 100% 96%;
+    --accent-foreground: 236 22% 19%;
+
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+
+    /* Border #E4E8F2 */
+    --border: 223 35% 92%;
+    --input: 223 35% 92%;
+    /* Blue #91C8FF */
+    --ring: 210 100% 78%;
+
+    --radius: 0.625rem;
+
+    /* White #FFFFFF sidebar */
+    --sidebar-background: 0 0% 100%;
+    --sidebar-foreground: 236 22% 19%;
+    --sidebar-primary: 210 100% 78%;
+    --sidebar-primary-foreground: 236 22% 19%;
+    --sidebar-accent: 209 99% 95%;
+    --sidebar-accent-foreground: 236 22% 19%;
+    --sidebar-border: 223 35% 92%;
+    --sidebar-ring: 210 100% 78%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: "Inter", ui-sans-serif, system-ui, sans-serif;
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+  }
+
+  button,
+  a {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  :where(p, span, li, h1, h2, h3, h4, h5, h6, a, button, label, td, th) {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
+  pre,
+  code {
+    overflow-x: auto;
+    white-space: pre;
+  }
+}
+
+@layer utilities {
+  .font-mono {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+}

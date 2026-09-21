@@ -48,12 +48,24 @@ or Kubernetes (Modules 3/4).
   parser distributions, `last_ingested_at`, success rate, upload blank/error lines)
   and `GET /dashboard`.
 
-### 4. UI (`ui/`, Next.js 16 client components)
-- Dashboard, Sources (list / new / detail with live stats + upload), Uploads
-  (polling), Events (filterable, auto-refresh), Event detail (traceability +
-  Bronze raw payload), DLQ list + detail.
-- Shared `ui/app/lib/api.ts` client; dark theme in `globals.css`.
-- `npm run build` and `npm run lint` are clean.
+### 4. UI (`ui/`, Vite + React 18 + Express 5 + TypeScript)
+- React SPA with an integrated Express API on one port (3000). Includes a
+  built-in multi-format log normalizer (`POST /api/normalize`): auto, JSON,
+  syslog, CEF, LEEF, key=value, Apache and plain-text parsing with
+  OCSF 1.3.0 classification.
+- **Backend integration** — the Express server exposes a same-origin proxy at
+  `/backend/*` (forwarded to `BACKEND_URL`, default `http://localhost:8000`).
+  The Sources registry is backed by the FastAPI Source Registry (create /
+  update / **delete**), and the Dashboard feeds, Normalized Events, DLQ and
+  Source detail pages read live data from the API (stats, per-source events,
+  per-source DLQ). When the backend is unreachable the UI falls back to its
+  local store so the workspace keeps working.
+- Pages: Dashboard, Sources (list / new / detail), Events (ingest / normalized /
+  DLQ), Parser configurations (incl. Drain3 and custom parsers), OCSF schema
+  explorer, Monitoring (metrics / logs / system health), plus a 404 catch-all.
+- Containerized via `ui/Dockerfile`; built with `pnpm build` and served with
+  `node dist/server/node-build.mjs`. `pnpm build`, `pnpm typecheck` and
+  `pnpm test` are clean.
 
 ### 5. Deployment
 - `docker-compose.yml`: new `file_collector` service; `./data/uploads` bind mount
