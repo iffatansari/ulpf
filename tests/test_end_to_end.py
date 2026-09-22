@@ -17,7 +17,7 @@ def test_syslog_raw_event_is_normalized_for_silver_index():
 		collector_id="syslog-collector-1",
 	)
 
-normalized, _ = normalize_raw_event(raw_event)
+	normalized, _ = normalize_raw_event(raw_event)
 
 	assert normalized is not None
 	assert normalized.event_id == "raw-1-norm"

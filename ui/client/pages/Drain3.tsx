@@ -6,6 +6,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { PageHeader } from "@/components/common/bits";
+import { clusterDrainLogs } from "@/lib/backend";
 
 const STEPS = ["Tokenize on delimiters", "Match longest common prefix", "Re-apply known templates", "Replace variable tokens"];
 
@@ -20,44 +21,10 @@ const DEFAULT_LOGS = `2024-01-22T12:42:48Z api-gateway INFO request from 203.0.1
 the icing inspector visited a sleeping bear
 ==============================`;
 
-const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
-const IP_RE = /(?:\d{1,3}\.){3}\d{1,3}/;
-const HEX_RE = /0x[0-9a-f]+|\b[0-9a-f]{8,}\b/i;
-
-function tokenKind(tok: string): string {
-  if (UUID_RE.test(tok)) return "<uuid>";
-  if (IP_RE.test(tok)) return "<ip>";
-  if (HEX_RE.test(tok) && /[0-9a-f]/i.test(tok)) return "<hex>";
-  if (/^\d+(\.\d+)?$/.test(tok)) return "<num>";
-  if (/^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}:\d{2}(\.\d+)?Z?)?$/.test(tok)) return "<time>";
-  if (/^"[\s\S]*"$/.test(tok)) return "<quoted>";
-  if (/^\[.*\]$/.test(tok)) return "<bracket>";
-  return tok;
-}
-
 interface Cluster {
   template: string;
   count: number;
   examples: string[];
-}
-
-function clusterLines(lines: string[]): Cluster[] {
-  const buckets = new Map<string, { count: number; examples: string[] }>();
-  for (const line of lines) {
-    if (!line.trim() || /^={3,}|^-{3,}$|^\d+$/.test(line.trim())) continue;
-    const tokens = line.trim().split(/\s+/).map(tokenKind);
-    const tpl = tokens.join(" ");
-    const b = buckets.get(tpl);
-    if (b) {
-      b.count += 1;
-      if (b.examples.length < 2) b.examples.push(line.trim());
-    } else {
-      buckets.set(tpl, { count: 1, examples: [line.trim()] });
-    }
-  }
-  return [...buckets.entries()]
-    .map(([template, b]) => ({ template, count: b.count, examples: b.examples }))
-    .sort((a, b) => b.count - a.count);
 }
 
 export default function Drain3() {
@@ -65,33 +32,24 @@ export default function Drain3() {
   const [clusters, setClusters] = useState<Cluster[] | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const run = () => {
+  const run = async () => {
     if (!logs.trim()) {
       toast.error("Paste some log lines first");
       return;
     }
     setBusy(true);
-    setTimeout(() => {
-      try {
-        setClusters(clusterLines(logs.split(/\r?\n/)));
-      } catch {
-        toast.error("Clustering failed");
-      } finally {
-        setBusy(false);
-      }
-    }, 120);
+    try {
+      setClusters(await clusterDrainLogs(logs));
+    } catch {
+      toast.error("Clustering failed");
+    } finally {
+      setBusy(false);
+    }
   };
 
   const variableCount = useMemo(() => {
     if (!clusters) return 0;
-    let p = 0;
-    clusters.forEach((c) => {
-      c.examples.forEach((e) => {
-        const a = e.trim().split(/\s+/).map(tokenKind).join(" ");
-        p += (a.match(/<(num|ip|uuid|hex|time|quoted|bracket)>/g) ?? []).length;
-      });
-    });
-    return p;
+    return clusters.reduce((total, c) => total + ((c.template.match(/<\*>/g) ?? []).length), 0);
   }, [clusters]);
 
   return (

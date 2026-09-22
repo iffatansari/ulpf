@@ -67,3 +67,26 @@ def parse(raw_payload: str) -> DrainResult:
     variables = [p.value for p in params] if params else []
 
     return DrainResult(matched=True, template=template, cluster_id=cluster_id, variables=variables)
+
+
+def cluster_lines(lines: list[str]) -> list[tuple[int, str]]:
+    """
+    Mine a batch of lines into (cluster_id, template) pairs, in input
+    order. Lines that would not produce a template (blank / whitespace
+    only) are skipped.
+
+    A fresh miner is built per call so a UI "cluster this paste" request
+    always yields the same grouping for the same lines. The in-process
+    _miner used by parse() keeps accumulating across the live stream,
+    which would make repeat clicks drift over time.
+    """
+    miner = _build_miner()
+    results: list[tuple[int, str]] = []
+
+    for line in lines:
+        if line is None or not line.strip():
+            continue
+        mined = miner.add_log_message(line)
+        results.append((mined["cluster_id"], mined["template_mined"]))
+
+    return results

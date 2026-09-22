@@ -119,8 +119,8 @@ services:
 
   api:
     build:
-      context: ./api
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: api/Dockerfile
     container_name: ulpf-api
     depends_on:
       opensearch:

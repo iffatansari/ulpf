@@ -15,6 +15,7 @@ from routes.sources import router as sources_router
 from routes.uploads import enrich_upload_counts, router as uploads_router
 from routes.events import router as events_router
 from routes.dlq import router as dlq_router
+from routes.drain import router as drain_router
 
 
 @asynccontextmanager
@@ -38,6 +39,7 @@ app.include_router(sources_router)
 app.include_router(uploads_router)
 app.include_router(events_router)
 app.include_router(dlq_router)
+app.include_router(drain_router)
 
 
 @app.get("/")
