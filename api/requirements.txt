@@ -4,3 +4,4 @@ opensearch-py
 pydantic
 httpx
 python-multipart
+drain3

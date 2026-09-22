@@ -169,6 +169,21 @@ export async function getBackendDashboard(limit = 5): Promise<BackendDashboard> 
 }
 
 // ---------------------------------------------------------------------------
+// Drain3 clustering (backed by orchestrator/parsers/drain_miner.py)
+// ---------------------------------------------------------------------------
+
+export interface DrainCluster {
+  template: string;
+  count: number;
+  examples: string[];
+}
+
+export async function clusterDrainLogs(content: string): Promise<DrainCluster[]> {
+  const data = await backendFetch<{ clusters: DrainCluster[] }>("/drain/cluster", jsonInit("POST", { content }));
+  return data.clusters ?? [];
+}
+
+// ---------------------------------------------------------------------------
 // Backend → UI source adapter (keeps the SourceRegistry UI shape)
 // ---------------------------------------------------------------------------
 

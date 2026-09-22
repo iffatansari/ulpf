@@ -171,9 +171,11 @@ def test_module2_pipeline_reconciliation(tmp_path, monkeypatch):
     bronze, silver, dlq = process_as_orchestrator(es, produced)
 
     assert bronze == nonblank == 3996
-    assert bronze == silver + dlq == 3585 + 411
-    assert silver == 3585  # syslog + json + cef
-    assert dlq == 411      # unknown lines dropped to DLQ
+    assert bronze == silver + dlq
+    # Known formats (syslog 1953 + json 1014 + cef 618) still normalize
+    # exactly:
+    assert silver == 3994  # = 3585 known-format + 409 rescued by drain3 fallback
+    assert dlq == 2        # remaining unknowns had no extractable identity
 
     # --- Bronze stores upload_id lineage metadata -----------------
     bronze_docs = [d for (idx, _), d in es.store.items() if idx == BRONZE_INDEX]
