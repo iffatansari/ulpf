@@ -1,11 +1,41 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactNode,
+} from "react";
 import type { LucideIcon } from "lucide-react";
-import { AppWindow, Cloud, Database, FileCog, HardDrive, KeyRound, Radar, Router } from "lucide-react";
+import {
+  AppWindow,
+  Cloud,
+  Database,
+  FileCog,
+  HardDrive,
+  KeyRound,
+  Radar,
+  Router,
+} from "lucide-react";
 import { ACCENT } from "@/lib/accents";
 import type { BackendSourceDoc } from "@/lib/backend";
-import { backendSourceToUi, createBackendSource, deleteBackendSource, listBackendSources, updateBackendSource } from "@/lib/backend";
+import {
+  backendSourceToUi,
+  createBackendSource,
+  deleteBackendSource,
+  listBackendSources,
+  updateBackendSource,
+} from "@/lib/backend";
 
-export type SourceTransportId = "syslog_udp" | "syslog_tcp" | "http_collect" | "file_agent" | "custom_api";
+export type SourceTransportId =
+  | "syslog_udp"
+  | "syslog_tcp"
+  | "http_collect"
+  | "sse_stream"
+  | "file_agent"
+  | "custom_api"
+  | "kafka_sim";
 
 export interface SourceTransport {
   id: SourceTransportId;
@@ -51,11 +81,43 @@ export interface NewSourceInput {
 }
 
 export const TRANSPORTS: SourceTransport[] = [
-  { id: "syslog_udp", label: "Syslog UDP", hint: "Classic device/network forwarding, port 514", port: 514 },
-  { id: "syslog_tcp", label: "Syslog TCP", hint: "Reliable streaming, port 5151", port: 5151 },
-  { id: "http_collect", label: "HTTP collector", hint: "POST raw batches to the ULPF ingest endpoint" },
-  { id: "file_agent", label: "File / agent", hint: "Ship an existing on-disk logfile or app output" },
-  { id: "custom_api", label: "Custom API", hint: "Anything that can POST JSON to /api/normalize" },
+  {
+    id: "syslog_udp",
+    label: "Syslog UDP",
+    hint: "Classic device/network forwarding, port 1514",
+    port: 1514,
+  },
+  {
+    id: "syslog_tcp",
+    label: "Syslog TCP",
+    hint: "Reliable streaming, port 5151",
+    port: 5151,
+  },
+  {
+    id: "http_collect",
+    label: "HTTP collector",
+    hint: "POST JSON events to the collector's /logs endpoint",
+  },
+  {
+    id: "sse_stream",
+    label: "SSE stream",
+    hint: "Consume a Server-Sent Events endpoint continuously",
+  },
+  {
+    id: "file_agent",
+    label: "File / agent",
+    hint: "Ship an existing on-disk logfile or app output",
+  },
+  {
+    id: "custom_api",
+    label: "Custom API",
+    hint: "Anything that can POST JSON to the HTTP collector",
+  },
+  {
+    id: "kafka_sim",
+    label: "Simulated live stream",
+    hint: "Synthetic events generated straight into the raw topic — no upstream needed",
+  },
 ];
 
 export const SOURCE_TYPES: SourceTypeDef[] = [
@@ -66,7 +128,8 @@ export const SOURCE_TYPES: SourceTypeDef[] = [
     color: ACCENT.blue,
     tint: ACCENT.blueMist,
     transports: ["syslog_udp", "syslog_tcp", "file_agent"],
-    sample: "src=203.0.113.5 dst=198.51.100.6 proto=tcp action=deny rule_name=internet-blocked",
+    sample:
+      "src=203.0.113.5 dst=198.51.100.6 proto=tcp action=deny rule_name=internet-blocked",
   },
   {
     id: "application",
@@ -74,8 +137,9 @@ export const SOURCE_TYPES: SourceTypeDef[] = [
     icon: AppWindow,
     color: ACCENT.mint,
     tint: ACCENT.mintMist,
-    transports: ["http_collect", "syslog_udp", "file_agent"],
-    sample: '{"@timestamp":"2022-06-08T09:00:00.000Z","app":"order-api","msg":"order created for customer 42","user":"amy","src_ip":"10.0.0.9"}',
+    transports: ["http_collect", "sse_stream", "syslog_udp", "file_agent", "kafka_sim"],
+    sample:
+      '{"@timestamp":"2022-06-08T09:00:00.000Z","app":"order-api","msg":"order created for customer 42","user":"amy","src_ip":"10.0.0.9"}',
   },
   {
     id: "cloud",
@@ -83,8 +147,9 @@ export const SOURCE_TYPES: SourceTypeDef[] = [
     icon: Cloud,
     color: ACCENT.lilac,
     tint: ACCENT.lilacMist,
-    transports: ["http_collect", "custom_api"],
-    sample: '{"@timestamp":"2022-06-08T09:00:00Z","operation":"CreateBucket","actor":"amy","source.ip":"10.0.0.1"}',
+    transports: ["http_collect", "sse_stream", "custom_api"],
+    sample:
+      '{"@timestamp":"2022-06-08T09:00:00Z","operation":"CreateBucket","actor":"amy","source.ip":"10.0.0.1"}',
   },
   {
     id: "database",
@@ -93,7 +158,8 @@ export const SOURCE_TYPES: SourceTypeDef[] = [
     color: ACCENT.amber,
     tint: ACCENT.amberMist,
     transports: ["syslog_udp", "file_agent"],
-    sample: 'time=2022-06-08T09:00:00Z db=orders query="SELECT * FROM users" user=amy',
+    sample:
+      'time=2022-06-08T09:00:00Z db=orders query="SELECT * FROM users" user=amy',
   },
   {
     id: "edr",
@@ -102,7 +168,8 @@ export const SOURCE_TYPES: SourceTypeDef[] = [
     color: ACCENT.emerald,
     tint: ACCENT.emeraldMist,
     transports: ["file_agent", "syslog_tcp"],
-    sample: '{"@timestamp":"2022-06-08T09:00:00Z","process_name":"powershell.exe","event_type":"malware detected","user":"svc-acct","threat":"Trojan.Win32.Fake","src_ip":"10.0.0.77"}',
+    sample:
+      '{"@timestamp":"2022-06-08T09:00:00Z","process_name":"powershell.exe","event_type":"malware detected","user":"svc-acct","threat":"Trojan.Win32.Fake","src_ip":"10.0.0.77"}',
   },
   {
     id: "iam",
@@ -111,7 +178,8 @@ export const SOURCE_TYPES: SourceTypeDef[] = [
     color: ACCENT.rose,
     tint: ACCENT.roseMist,
     transports: ["syslog_udp", "http_collect"],
-    sample: 'time=2022-06-08T09:00:00Z user=amy action="user created" event_type=4720',
+    sample:
+      'time=2022-06-08T09:00:00Z user=amy action="user created" event_type=4720',
   },
   {
     id: "iot",
@@ -120,7 +188,8 @@ export const SOURCE_TYPES: SourceTypeDef[] = [
     color: ACCENT.gray,
     tint: ACCENT.grayMist,
     transports: ["syslog_udp", "custom_api"],
-    sample: 'time=2022-06-08T09:00:00Z device=sensor-07 message="invalid auth attempt" src_ip=10.0.0.50',
+    sample:
+      'time=2022-06-08T09:00:00Z device=sensor-07 message="invalid auth attempt" src_ip=10.0.0.50',
   },
   {
     id: "custom",
@@ -128,8 +197,9 @@ export const SOURCE_TYPES: SourceTypeDef[] = [
     icon: FileCog,
     color: ACCENT.gray,
     tint: ACCENT.grayMist,
-    transports: ["custom_api", "http_collect"],
-    sample: "line=1 ts=2022-06-08T09:00:00Z level=error message=timeout user=cron",
+    transports: ["custom_api", "http_collect", "sse_stream", "kafka_sim"],
+    sample:
+      "line=1 ts=2022-06-08T09:00:00Z level=error message=timeout user=cron",
   },
 ];
 
@@ -150,8 +220,10 @@ const TRANSPORT_TO_BACKEND: Record<string, string> = {
   syslog_udp: "udp",
   syslog_tcp: "other",
   http_collect: "http",
+  sse_stream: "sse",
   file_agent: "file",
   custom_api: "other",
+  kafka_sim: "kafka_sim",
 };
 
 function loadStore(): Source[] {
@@ -164,6 +236,26 @@ function loadStore(): Source[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * Merge the registry into the current list instead of replacing it.
+ *
+ * A blind `docs.map(backendSourceToUi)` drops `lastRun`, which only ever lives
+ * in the browser, so every refresh would wipe the "last run" acceptance stats.
+ * Dropping the list wholesale is also what makes a source deleted server-side
+ * linger as a ghost until a manual reload.
+ */
+export function reconcile(
+  docs: Awaited<ReturnType<typeof listBackendSources>>,
+  previous: Source[],
+): Source[] {
+  const prior = new Map(previous.map((source) => [source.id, source]));
+  return docs.map((doc) => {
+    const next = backendSourceToUi(doc);
+    const lastRun = prior.get(next.id)?.lastRun;
+    return lastRun ? { ...next, lastRun } : next;
+  });
 }
 
 interface SourceContextValue {
@@ -202,7 +294,7 @@ export function SourceRegistryProvider({ children }: { children: ReactNode }) {
       try {
         const docs = await listBackendSources();
         if (cancelled) return;
-        setSources(docs.map(backendSourceToUi));
+        setSources((prev) => reconcile(docs, prev));
         setBackendOk(true);
       } catch {
         if (cancelled) return;
@@ -227,13 +319,31 @@ export function SourceRegistryProvider({ children }: { children: ReactNode }) {
   const refresh = useCallback(async () => {
     try {
       const docs = await listBackendSources();
-      setSources(docs.map(backendSourceToUi));
+      setSources((prev) => reconcile(docs, prev));
       setBackendOk(true);
       return;
     } catch {
       setBackendOk(false);
     }
   }, []);
+
+  // The registry is the source of truth, but only the mount effect reads it.
+  // A tab left open across a reset keeps a stale id, so a source created,
+  // renamed or deleted on the server never shows up. Reconcile periodically
+  // and again on wake, when browsers have throttled the timers.
+  useEffect(() => {
+    const tick = setInterval(refresh, 30000);
+    const onWake = () => {
+      if (document.visibilityState === "visible") refresh();
+    };
+    document.addEventListener("visibilitychange", onWake);
+    window.addEventListener("focus", onWake);
+    return () => {
+      clearInterval(tick);
+      document.removeEventListener("visibilitychange", onWake);
+      window.removeEventListener("focus", onWake);
+    };
+  }, [refresh]);
 
   const addSource = useCallback(
     async (input: NewSourceInput): Promise<Source> => {
@@ -251,8 +361,14 @@ export function SourceRegistryProvider({ children }: { children: ReactNode }) {
       }
 
       const type = SOURCE_TYPES.find((t) => t.id === input.typeId);
-      const transport = TRANSPORTS.find((t) => t.id === input.transport) ?? TRANSPORTS[2];
-      const endpoint = transport.port !== undefined ? String(transport.port) : `/api/normalize`;
+      const transport =
+        TRANSPORTS.find((t) => t.id === input.transport) ?? TRANSPORTS[2];
+      const endpoint =
+        transport.port !== undefined
+          ? String(transport.port)
+          : transport.id === "sse_stream"
+            ? "https://<upstream-host>/events"
+            : `/api/normalize`;
       const source: Source = {
         id: uid(),
         name: input.name.trim(),
@@ -260,7 +376,10 @@ export function SourceRegistryProvider({ children }: { children: ReactNode }) {
         transport: transport.id,
         endpoint,
         format: "auto",
-        parser_chain: ["Format auto-detect", "Primary chain · to be set on first import"],
+        parser_chain: [
+          "Format auto-detect",
+          "Primary chain · to be set on first import",
+        ],
         createdAt: Date.now(),
       };
       void type;
@@ -286,10 +405,17 @@ export function SourceRegistryProvider({ children }: { children: ReactNode }) {
 
   const updateSource = useCallback(
     (id: string, patch: Partial<Source>) => {
-      setSources((prev) => prev.map((s) => (s.id === id ? { ...s, ...patch } : s)));
+      setSources((prev) =>
+        prev.map((s) => (s.id === id ? { ...s, ...patch } : s)),
+      );
 
       if (!backendOk) return;
-      const apiPatch: Partial<Pick<BackendSourceDoc, "name" | "expected_format" | "enabled" | "description">> = {};
+      const apiPatch: Partial<
+        Pick<
+          BackendSourceDoc,
+          "name" | "expected_format" | "enabled" | "description"
+        >
+      > = {};
       if (patch.name !== undefined) apiPatch.name = patch.name;
       if (patch.format !== undefined) apiPatch.expected_format = patch.format;
       if (Object.keys(apiPatch).length === 0) return;
@@ -297,7 +423,11 @@ export function SourceRegistryProvider({ children }: { children: ReactNode }) {
       void updateBackendSource(id, apiPatch)
         .then((doc) => {
           const source = backendSourceToUi(doc);
-          setSources((prev) => prev.map((s) => (s.id === id ? { ...source, lastRun: s.lastRun } : s)));
+          setSources((prev) =>
+            prev.map((s) =>
+              s.id === id ? { ...source, lastRun: s.lastRun } : s,
+            ),
+          );
         })
         .catch(() => {
           // local state already reflects the patch
@@ -306,17 +436,42 @@ export function SourceRegistryProvider({ children }: { children: ReactNode }) {
     [backendOk],
   );
 
-  const reportRun = useCallback((id: string, stats: Omit<SourceRunStats, "at">) => {
-    setSources((prev) =>
-      prev.map((s) => (s.id === id ? { ...s, lastRun: { ...stats, at: Date.now() } } : s)),
-    );
-  }, []);
+  const reportRun = useCallback(
+    (id: string, stats: Omit<SourceRunStats, "at">) => {
+      setSources((prev) =>
+        prev.map((s) =>
+          s.id === id ? { ...s, lastRun: { ...stats, at: Date.now() } } : s,
+        ),
+      );
+    },
+    [],
+  );
 
   const loadDemo = useCallback(() => {
-    const demos: { name: string; typeId: string; transport: SourceTransportId; endpoint: string }[] = [
-      { name: "Edge firewall (PAN-OS)", typeId: "firewall", transport: "syslog_udp", endpoint: "514" },
-      { name: "Order API (HTTP)", typeId: "application", transport: "http_collect", endpoint: "/api/normalize" },
-      { name: "Endpoint EDR agent", typeId: "edr", transport: "file_agent", endpoint: "/var/log/edr/events.ndjson" },
+    const demos: {
+      name: string;
+      typeId: string;
+      transport: SourceTransportId;
+      endpoint: string;
+    }[] = [
+      {
+        name: "Edge firewall (PAN-OS)",
+        typeId: "firewall",
+        transport: "syslog_udp",
+        endpoint: "1514",
+      },
+      {
+        name: "Order API (HTTP)",
+        typeId: "application",
+        transport: "http_collect",
+        endpoint: "http://localhost:8081/logs",
+      },
+      {
+        name: "Endpoint EDR agent",
+        typeId: "edr",
+        transport: "file_agent",
+        endpoint: "/var/log/edr/events.ndjson",
+      },
     ];
 
     if (backendOk) {
@@ -354,16 +509,48 @@ export function SourceRegistryProvider({ children }: { children: ReactNode }) {
     setSources((prev) => [...demo, ...prev]);
   }, [backendOk, refresh, sources]);
 
-  const sourceById = useCallback((id: string) => sources.find((s) => s.id === id), [sources]);
-  const sourceType = useCallback((source: Source) => SOURCE_TYPES.find((t) => t.id === source.typeId), []);
+  const sourceById = useCallback(
+    (id: string) => sources.find((s) => s.id === id),
+    [sources],
+  );
+  const sourceType = useCallback(
+    (source: Source) => SOURCE_TYPES.find((t) => t.id === source.typeId),
+    [],
+  );
   const idForName = useCallback(
     (name: string) => sources.find((s) => s.name === name)?.id,
     [sources],
   );
 
   const value = useMemo(
-    () => ({ sources, addSource, removeSource, updateSource, reportRun, loadDemo, sourceById, sourceType, idForName, refresh, busy, backendOk }),
-    [sources, addSource, removeSource, updateSource, reportRun, loadDemo, sourceById, sourceType, idForName, refresh, busy, backendOk],
+    () => ({
+      sources,
+      addSource,
+      removeSource,
+      updateSource,
+      reportRun,
+      loadDemo,
+      sourceById,
+      sourceType,
+      idForName,
+      refresh,
+      busy,
+      backendOk,
+    }),
+    [
+      sources,
+      addSource,
+      removeSource,
+      updateSource,
+      reportRun,
+      loadDemo,
+      sourceById,
+      sourceType,
+      idForName,
+      refresh,
+      busy,
+      backendOk,
+    ],
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
@@ -371,26 +558,83 @@ export function SourceRegistryProvider({ children }: { children: ReactNode }) {
 
 export function useSources(): SourceContextValue {
   const v = useContext(Ctx);
-  if (!v) throw new Error("useSources must be used within SourceRegistryProvider");
+  if (!v)
+    throw new Error("useSources must be used within SourceRegistryProvider");
   return v;
 }
 
 export type DeployMode = "agent" | "container";
 
-export function collectorSnippet(source: Source, mode: DeployMode = "agent"): string {
-  const host = "<ulpf-host:8080>";
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function upstreamHost(url: string): string {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "<upstream-host>";
+  }
+}
+
+export function collectorSnippet(
+  source: Source,
+  mode: DeployMode = "agent",
+): string {
+  const apiHost = "<ulpf-api-host:8000>";
+  const sourceId = JSON.stringify(
+    source.id === "draft" ? "<source-id-assigned-after-create>" : source.id,
+  );
+  const sourceType = JSON.stringify(TYPE_TO_BACKEND[source.typeId] ?? "custom");
   const quoted = JSON.stringify(source.name);
   if (mode === "container") {
-    const vol = source.transport === "file_agent" ? `  -v ${source.endpoint || "/var/log/app/app.log"}:/logs:ro \\` : undefined;
+    if (source.transport === "kafka_sim") {
+      return [
+        `# set these in .env before starting the simulator`,
+        `SIM_SOURCE_ID=${shellQuote(source.id === "draft" ? "<source-id-assigned-after-create>" : source.id)}`,
+        `SIM_RATE=2`,
+        `SIM_FORMAT=syslog,cef,json,unknown`,
+        `docker compose --profile sim up --build -d live_sim`,
+      ].join("\n");
+    }
+    if (source.transport === "sse_stream") {
+      const upstreamUrl = source.endpoint || "https://<upstream-host>/events";
+      return [
+        `# set these in .env before starting the collector`,
+        `UPSTREAM_SSE_URL=${shellQuote(upstreamUrl)}`,
+        `SSE_ALLOWED_HOSTS=${shellQuote(upstreamHost(upstreamUrl))}`,
+        `SSE_SOURCE_ID=${shellQuote(source.id === "draft" ? "<source-id-assigned-after-create>" : source.id)}`,
+        `SSE_SOURCE_TYPE=${shellQuote(TYPE_TO_BACKEND[source.typeId] ?? "custom")}`,
+        `# optional: SSE_BEARER_TOKEN (HTTPS upstreams only)`,
+        `docker compose --profile sse up --build -d sse_collector`,
+      ].join("\n");
+    }
+    if (source.transport === "file_agent") {
+      return [
+        `# upload a file through the ULPF API; the API invokes the file collector`,
+        `curl -s -F "file=@${source.endpoint || "/var/log/app/app.log"}" ${apiHost}/sources/${source.id}/upload`,
+      ].join("\n");
+    }
     const port =
-      source.transport === "syslog_udp" ? `  -p ${source.endpoint || "514"}:${source.endpoint || "514"}/udp \\` : source.transport === "syslog_tcp" ? `  -p ${source.endpoint || "5151"}:${source.endpoint || "5151"} \\` : undefined;
+      source.transport === "syslog_udp"
+        ? `  -p ${source.endpoint || "1514"}:${source.endpoint || "1514"}/udp \\`
+        : source.transport === "syslog_tcp"
+          ? `  -p ${source.endpoint || "5151"}:${source.endpoint || "5151"} \\`
+          : source.transport === "http_collect" ||
+              source.transport === "custom_api"
+            ? `  -p 8081:8081 \\`
+            : undefined;
+    const sourceEnv =
+      source.transport === "http_collect" || source.transport === "custom_api"
+        ? "DEFAULT"
+        : "SOURCE";
     return [
-      `# one-click deployment: run the ULPF collector as a container (agent or agentless sidecar)`,
+      `# run the ULPF collector as a container`,
       `docker run -d --name ulpf-collector \\`,
-      source.transport === "file_agent" ? vol : port,
-      `  -e ULPF_INGEST_URL=${host}/api/normalize \\`,
-      `  -e ULPF_SOURCE_NAME=${quoted} \\`,
-      `  -e ULPF_TRANSPORT=${source.transport.replace("_", "-")} \\`,
+      port,
+      `  -e ${sourceEnv}_ID=${sourceId} \\`,
+      `  -e ${sourceEnv}_TYPE=${sourceType} \\`,
+      `  -e COLLECTOR_ID=${quoted} \\`,
       `  <ulpf-collector-image:latest>`,
     ]
       .filter((l): l is string => typeof l === "string")
@@ -401,24 +645,47 @@ export function collectorSnippet(source: Source, mode: DeployMode = "agent"): st
     case "syslog_tcp":
       return [
         `# ${source.transport === "syslog_udp" ? "UDP" : "TCP"} forward → ULPF ingest`,
-        `*.* action(type="omfwd" target="<ulpf-host>" port="${source.endpoint || (source.transport === "syslog_udp" ? "514" : "5151")}" protocol="${source.transport === "syslog_udp" ? "udp" : "tcp"}")`,
+        `*.* action(type="omfwd" target="<ulpf-host>" port="${source.endpoint || (source.transport === "syslog_udp" ? "1514" : "5151")}" protocol="${source.transport === "syslog_udp" ? "udp" : "tcp"}")`,
         ``,
-        `# and every line is accepted with source.name="${source.name}"`,
+        `# configure the collector with SOURCE_ID=${sourceId} and SOURCE_TYPE=${sourceType}`,
       ].join("\n");
     case "http_collect":
     case "custom_api":
       return [
-        `# POST raw batches to the ULPF ingest endpoint (source.name tags every event)`,
-        `curl -s ${host}/api/normalize -H "content-type: application/json" -d @- <<JSON`,
-        `{"content":"<paste or cat a logfile>","source":{"name":${quoted}}}`,
-        `JSON`,
+        `# POST events to the HTTP collector; source_id keeps the stream attributed`,
+        `curl -s ${source.endpoint || "http://localhost:8081/logs"} -H "content-type: application/json" -d '{`,
+        `  "source_id": ${sourceId},`,
+        `  "source_type": ${sourceType},`,
+        `  "events": [{"message":"hello from ${source.name}"}]`,
+        `}'`,
       ].join("\n");
+    case "sse_stream": {
+      const upstreamUrl = source.endpoint || "https://<upstream-host>/events";
+      return [
+        `export UPSTREAM_SSE_URL=${shellQuote(upstreamUrl)}`,
+        `export SSE_ALLOWED_HOSTS=${shellQuote(upstreamHost(upstreamUrl))}`,
+        `export SSE_SOURCE_ID=${shellQuote(source.id === "draft" ? "<source-id-assigned-after-create>" : source.id)}`,
+        `export SSE_SOURCE_TYPE=${shellQuote(TYPE_TO_BACKEND[source.typeId] ?? "custom")}`,
+        `# optional: export SSE_BEARER_TOKEN=... (HTTPS upstreams only)`,
+        `python -m collectors.sse_collector.main`,
+      ].join("\n");
+    }
+    case "kafka_sim": {
+      const resolved = source.id === "draft" ? "<source-id-assigned-after-create>" : source.id;
+      return [
+        `# generate a continuous synthetic stream into the raw topic`,
+        `python demo/kafka_live_producer.py --source-id ${resolved} --rate 2`,
+        ``,
+        `# preview without a broker, then Ctrl-C to stop`,
+        `python demo/kafka_live_producer.py --source-id ${resolved} --dry-run --count 8`,
+      ].join("\n");
+    }
     case "file_agent":
       return [
-        `# one-shot agent: forward an existing on-disk logfile`,
-        `cat ${source.endpoint || "/var/log/app/app.log"} | jq -R -s '{content: ., source: {name: ${quoted}}}' | curl -s ${host}/api/normalize -H "content-type: application/json" --data-binary @-`,
+        `# upload a file to the API; the API streams it through the file collector`,
+        `curl -s -F "file=@${source.endpoint || "/var/log/app/app.log"}" ${apiHost}/sources/${source.id}/upload`,
       ].join("\n");
     default:
-      return `POST ${host}/api/normalize with JSON { "content": "...", "source": { "name": ${quoted} } }`;
+      return `POST http://localhost:8081/logs with JSON { "source_id": ${sourceId}, "events": [...] }`;
   }
 }

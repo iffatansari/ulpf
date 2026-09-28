@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from aiokafka import AIOKafkaProducer
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from schema.raw_event import RawEventEnvelope
@@ -26,12 +26,59 @@ COLLECTOR_ID = os.getenv(
     "http-json-collector-1",
 )
 
+DEFAULT_SOURCE_ID = os.getenv(
+    "DEFAULT_SOURCE_ID",
+    "http-json-source-1",
+)
+
+DEFAULT_SOURCE_TYPE = os.getenv(
+    "DEFAULT_SOURCE_TYPE",
+    "application",
+)
+
+VALID_SOURCE_TYPES = {
+    "network_device",
+    "server",
+    "application",
+    "database",
+    "cloud",
+    "iot",
+    "custom",
+}
+
 HTTP_PORT = int(
     os.getenv(
         "HTTP_PORT",
         "8081",
     )
 )
+MAX_HTTP_BODY_BYTES = max(
+    1024,
+    int(os.getenv("MAX_HTTP_BODY_BYTES", str(10 * 1024 * 1024))),
+)
+MAX_EVENTS_PER_REQUEST = max(
+    1,
+    int(os.getenv("MAX_EVENTS_PER_REQUEST", "1000")),
+)
+
+
+async def read_limited_body(request: Request) -> bytes:
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_HTTP_BODY_BYTES:
+                raise HTTPException(status_code=413, detail="request body is too large")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid content-length") from exc
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_HTTP_BODY_BYTES:
+            raise HTTPException(status_code=413, detail="request body is too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 async def send_raw_payload(
@@ -122,7 +169,7 @@ async def ingest_logs(request: Request):
 
     # Read the original request body first.
     # This allows us to preserve malformed JSON.
-    body = await request.body()
+    body = await read_limited_body(request)
 
     raw_body = body.decode(
         "utf-8",
@@ -140,8 +187,8 @@ async def ingest_logs(request: Request):
         event = await send_raw_payload(
             producer=producer,
             raw_payload=raw_body,
-            source_id="http-json-source-1",
-            source_type="application",
+            source_id=DEFAULT_SOURCE_ID,
+            source_type=DEFAULT_SOURCE_TYPE,
             format_hint="json",
         )
 
@@ -164,15 +211,50 @@ async def ingest_logs(request: Request):
             },
         )
 
+    if not isinstance(data, dict):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "rejected",
+                "reason": "invalid_payload",
+                "message": "Request body must be a JSON object.",
+            },
+        )
+
     source_id = data.get(
         "source_id",
-        "http-json-source-1",
+        DEFAULT_SOURCE_ID,
     )
 
     source_type = data.get(
         "source_type",
-        "application",
+        DEFAULT_SOURCE_TYPE,
     )
+
+    if isinstance(source_id, str):
+        source_id = source_id.strip()
+    if isinstance(source_type, str):
+        source_type = source_type.strip()
+
+    if not isinstance(source_id, str) or not source_id or len(source_id) > 200:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "rejected",
+                "reason": "invalid_source_id",
+                "message": "source_id must be a non-empty string up to 200 characters.",
+            },
+        )
+
+    if not isinstance(source_type, str) or source_type not in VALID_SOURCE_TYPES:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "rejected",
+                "reason": "invalid_source_type",
+                "message": "source_type is not supported.",
+            },
+        )
 
     events = data.get(
         "events",
@@ -192,6 +274,16 @@ async def ingest_logs(request: Request):
                     "'events' must be a JSON object "
                     "or an array of objects."
                 ),
+            },
+        )
+
+    if len(events) > MAX_EVENTS_PER_REQUEST:
+        return JSONResponse(
+            status_code=413,
+            content={
+                "status": "rejected",
+                "reason": "too_many_events",
+                "message": f"events must contain at most {MAX_EVENTS_PER_REQUEST} items.",
             },
         )
 

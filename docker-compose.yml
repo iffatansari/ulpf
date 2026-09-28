@@ -13,7 +13,7 @@ services:
       - --advertise-kafka-addr
       - PLAINTEXT://redpanda:29092,OUTSIDE://localhost:9092
     ports:
-      - "9092:9092"
+      - "127.0.0.1:9092:9092"
     volumes:
       - redpanda-data:/var/lib/redpanda/data
     healthcheck:
@@ -30,8 +30,8 @@ services:
       plugins.security.disabled: "true"
       OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
     ports:
-      - "9200:9200"
-      - "9600:9600"
+      - "127.0.0.1:9200:9200"
+      - "127.0.0.1:9600:9600"
     volumes:
       - opensearch-data:/usr/share/opensearch/data
     healthcheck:
@@ -52,9 +52,13 @@ services:
       REDPANDA_BROKER: redpanda:29092
       RAW_TOPIC: logs.raw
       COLLECTOR_ID: syslog-collector-1
+      SOURCE_ID: syslog-source-1
+      SOURCE_TYPE: server
       SYSLOG_PORT: 1514
+      SYSLOG_TCP_PORT: 5151
     ports:
       - "1514:1514/udp"
+      - "5151:5151/tcp"
     restart: on-failure
 
   http_json_collector:
@@ -69,10 +73,72 @@ services:
       REDPANDA_BROKER: redpanda:29092
       RAW_TOPIC: logs.raw
       COLLECTOR_ID: http-json-collector-1
+      DEFAULT_SOURCE_ID: http-json-source-1
+      DEFAULT_SOURCE_TYPE: application
       HTTP_PORT: 8081
     ports:
       - "8081:8081"
     restart: on-failure
+
+  sse_collector:
+    profiles: ["sse"]
+    build:
+      context: .
+      dockerfile: collectors/sse_collector/Dockerfile
+    container_name: ulpf-sse-collector
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      REDPANDA_BROKER: redpanda:29092
+      RAW_TOPIC: logs.raw
+      UPSTREAM_SSE_URL: ${UPSTREAM_SSE_URL:-}
+      SSE_SOURCE_ID: ${SSE_SOURCE_ID:-sse-source-1}
+      SSE_SOURCE_TYPE: ${SSE_SOURCE_TYPE:-application}
+      SSE_COLLECTOR_ID: sse-collector-1
+      SSE_ALLOWED_HOSTS: ${SSE_ALLOWED_HOSTS:-}
+      SSE_BEARER_TOKEN: ${SSE_BEARER_TOKEN:-}
+      SSE_ALLOW_INSECURE_HTTP: ${SSE_ALLOW_INSECURE_HTTP:-false}
+      SSE_FORMAT_HINT: ${SSE_FORMAT_HINT:-auto}
+      SSE_CONNECT_TIMEOUT_SECONDS: ${SSE_CONNECT_TIMEOUT_SECONDS:-10}
+      SSE_READ_TIMEOUT_SECONDS: ${SSE_READ_TIMEOUT_SECONDS:-60}
+      SSE_RECONNECT_INITIAL_SECONDS: ${SSE_RECONNECT_INITIAL_SECONDS:-1}
+      SSE_RECONNECT_MAX_SECONDS: ${SSE_RECONNECT_MAX_SECONDS:-30}
+      SSE_MAX_EVENT_BYTES: ${SSE_MAX_EVENT_BYTES:-262144}
+      SSE_MAX_WIRE_BYTES: ${SSE_MAX_WIRE_BYTES:-900000}
+      SSE_RETRY_MAX_SECONDS: ${SSE_RETRY_MAX_SECONDS:-300}
+    restart: on-failure
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 256m
+    pids_limit: 128
+
+  live_sim:
+    profiles: ["sim"]
+    build:
+      context: .
+      dockerfile: demo/Dockerfile
+    container_name: ulpf-live-sim
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      REDPANDA_BROKER: redpanda:29092
+      RAW_TOPIC: logs.raw
+      SIM_SOURCE_ID: ${SIM_SOURCE_ID:-sse-source-1}
+      SIM_SOURCE_TYPE: ${SIM_SOURCE_TYPE:-application}
+      SIM_RATE: ${SIM_RATE:-2}
+      SIM_FORMAT: ${SIM_FORMAT:-syslog,cef,json,unknown}
+      SIM_COLLECTOR_ID: ${SIM_COLLECTOR_ID:-live-sim-1}
+    restart: on-failure
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 256m
+    pids_limit: 128
 
   file_collector:
     build:
@@ -115,6 +181,7 @@ services:
       SILVER_INDEX: ulpf-silver
       DLQ_INDEX: ulpf-dlq
       BRONZE_INDEX: ulpf-bronze
+      REPROCESS_RUNS_INDEX: ulpf-reprocess-runs
     restart: on-failure
 
   api:
@@ -123,22 +190,29 @@ services:
       dockerfile: api/Dockerfile
     container_name: ulpf-api
     depends_on:
+      redpanda:
+        condition: service_healthy
       opensearch:
         condition: service_healthy
     environment:
+      REDPANDA_BROKER: redpanda:29092
+      RAW_TOPIC: logs.raw
+      NORMALIZED_TOPIC: logs.normalized
       OPENSEARCH_URL: http://opensearch:9200
       SILVER_INDEX: ulpf-silver
       DLQ_INDEX: ulpf-dlq
       BRONZE_INDEX: ulpf-bronze
       SOURCES_INDEX: ulpf-sources
       UPLOADS_INDEX: ulpf-uploads
+      REPROCESS_RUNS_INDEX: ulpf-reprocess-runs
       UPLOAD_DIR: /data/uploads
       FILE_COLLECTOR_URL: http://file_collector:8082
+      CORS_ORIGINS: http://localhost:8080,http://localhost:3000
       MAX_UPLOAD_MB: "100"
     volumes:
       - ${PWD:-.}/data/uploads:/data/uploads
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     restart: on-failure
 
   ui:

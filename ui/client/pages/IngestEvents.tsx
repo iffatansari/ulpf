@@ -1,7 +1,10 @@
 import { useRef } from "react";
+import { Link } from "react-router-dom";
+import { ArrowRight } from "lucide-react";
 import { PageHeader } from "@/components/common/bits";
 import NormalizerForm from "@/components/normalizer/NormalizerForm";
 import ResultsView from "@/components/normalizer/ResultsView";
+import { Button } from "@/components/ui/button";
 import { useNormalizer } from "@/lib/normalize-context";
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 
@@ -15,7 +18,15 @@ export default function IngestEvents() {
         eyebrow="Events · Ingest"
         title="Ingest events"
         subtitle="Paste or upload logs from any source. Every line is parsed for real fields only — nothing is fabricated — and mapped to an OCSF event class with valid enum values."
-      />
+      >
+        {result && (
+          <Button asChild variant="outline" size="sm">
+            <Link to="/events/normalized">
+              Open events <ArrowRight className="h-3.5 w-3.5" />
+            </Link>
+          </Button>
+        )}
+      </PageHeader>
       <NormalizerForm onDone={() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })} />
       <div ref={resultsRef} className="scroll-mt-20">
         <ResultsView />

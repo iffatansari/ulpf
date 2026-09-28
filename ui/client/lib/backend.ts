@@ -1,4 +1,8 @@
-import type { NormalizedEventResult, OcsfEvent, RejectedEventResult } from "@shared/api";
+import type {
+  NormalizedEventResult,
+  OcsfEvent,
+  RejectedEventResult,
+} from "@shared/api";
 import type { Source, SourceTransportId } from "./source-context";
 
 /**
@@ -127,16 +131,29 @@ export interface BackendSourceCreate {
   description?: string;
 }
 
-export async function createBackendSource(input: BackendSourceCreate): Promise<BackendSourceDoc> {
-  const data = await backendFetch<{ source: BackendSourceDoc }>("/sources", jsonInit("POST", input));
+export async function createBackendSource(
+  input: BackendSourceCreate,
+): Promise<BackendSourceDoc> {
+  const data = await backendFetch<{ source: BackendSourceDoc }>(
+    "/sources",
+    jsonInit("POST", input),
+  );
   return data.source;
 }
 
 export async function updateBackendSource(
   sourceId: string,
-  patch: Partial<Pick<BackendSourceDoc, "name" | "expected_format" | "enabled" | "description">>,
+  patch: Partial<
+    Pick<
+      BackendSourceDoc,
+      "name" | "expected_format" | "enabled" | "description"
+    >
+  >,
 ): Promise<BackendSourceDoc> {
-  const data = await backendFetch<{ source: BackendSourceDoc }>(`/sources/${sourceId}`, jsonInit("PUT", patch));
+  const data = await backendFetch<{ source: BackendSourceDoc }>(
+    `/sources/${sourceId}`,
+    jsonInit("PUT", patch),
+  );
   return data.source;
 }
 
@@ -144,7 +161,9 @@ export async function deleteBackendSource(sourceId: string): Promise<void> {
   await backendFetch<unknown>(`/sources/${sourceId}`, { method: "DELETE" });
 }
 
-export async function getBackendSourceStats(sourceId: string): Promise<SourceStats> {
+export async function getBackendSourceStats(
+  sourceId: string,
+): Promise<SourceStats> {
   return backendFetch<SourceStats>(`/sources/${sourceId}/stats`);
 }
 
@@ -152,19 +171,100 @@ export async function getBackendSourceStats(sourceId: string): Promise<SourceSta
 // Events & DLQ
 // ---------------------------------------------------------------------------
 
-export async function listBackendEvents(limit = 50): Promise<{ total: number; events: BackendNormalizedEvent[] }> {
-  return backendFetch<{ total: number; events: BackendNormalizedEvent[] }>(`/events?limit=${limit}`);
+export async function listBackendEvents(
+  limit = 50,
+): Promise<{ total: number; events: BackendNormalizedEvent[] }> {
+  return backendFetch<{ total: number; events: BackendNormalizedEvent[] }>(
+    `/events?limit=${limit}`,
+  );
 }
 
-export async function getBackendSourceEvents(sourceId: string, limit = 50): Promise<{ total: number; events: BackendNormalizedEvent[] }> {
-  return backendFetch<{ total: number; events: BackendNormalizedEvent[] }>(`/sources/${sourceId}/events?limit=${limit}`);
+export async function getBackendSourceEvents(
+  sourceId: string,
+  limit = 50,
+): Promise<{ total: number; events: BackendNormalizedEvent[] }> {
+  return backendFetch<{ total: number; events: BackendNormalizedEvent[] }>(
+    `/sources/${sourceId}/events?limit=${limit}`,
+  );
 }
 
-export async function listBackendDlq(limit = 200): Promise<{ total: number; records: BackendDlqRecord[] }> {
-  return backendFetch<{ total: number; records: BackendDlqRecord[] }>(`/dlq?limit=${limit}`);
+export interface BackendEventStreamHandlers {
+  onEvent: (event: BackendNormalizedEvent) => void;
+  onOpen?: () => void;
+  onError?: () => void;
+  onReset?: () => void;
 }
 
-export async function getBackendDashboard(limit = 5): Promise<BackendDashboard> {
+export function subscribeToBackendEvents(
+  sourceId: string | undefined,
+  handlers: BackendEventStreamHandlers,
+): () => void {
+  if (typeof window === "undefined" || typeof EventSource === "undefined")
+    return () => {};
+
+  const query = sourceId ? `?source_id=${encodeURIComponent(sourceId)}` : "";
+  const stream = new EventSource(`/backend/events/stream${query}`);
+  const handleMessage = (event: Event) => {
+    try {
+      const payload = JSON.parse(
+        (event as MessageEvent<string>).data,
+      ) as BackendNormalizedEvent;
+      if (
+        payload &&
+        typeof payload === "object" &&
+        typeof payload.event_id === "string"
+      ) {
+        handlers.onEvent(payload);
+      }
+    } catch {
+      handlers.onError?.();
+    }
+  };
+
+  const handleReset = () => handlers.onReset?.();
+  stream.addEventListener("normalized", handleMessage);
+  stream.addEventListener("reset", handleReset);
+  stream.onopen = () => handlers.onOpen?.();
+  stream.onerror = () => handlers.onError?.();
+
+  return () => {
+    stream.removeEventListener("normalized", handleMessage);
+    stream.removeEventListener("reset", handleReset);
+    stream.close();
+  };
+}
+
+export function mergeBackendEvents(
+  current: BackendNormalizedEvent[],
+  incoming: BackendNormalizedEvent[],
+  limit = 50,
+): BackendNormalizedEvent[] {
+  const byId = new Map<string, BackendNormalizedEvent>();
+  for (const event of [...current, ...incoming]) {
+    if (event.event_id) byId.set(event.event_id, event);
+  }
+  return [...byId.values()]
+    .sort((left, right) => backendEventTime(right) - backendEventTime(left))
+    .slice(0, limit);
+}
+
+function backendEventTime(event: BackendNormalizedEvent): number {
+  return typeof event.time === "number"
+    ? event.time
+    : Date.parse(event.time) || 0;
+}
+
+export async function listBackendDlq(
+  limit = 200,
+): Promise<{ total: number; records: BackendDlqRecord[] }> {
+  return backendFetch<{ total: number; records: BackendDlqRecord[] }>(
+    `/dlq?limit=${limit}`,
+  );
+}
+
+export async function getBackendDashboard(
+  limit = 5,
+): Promise<BackendDashboard> {
   return backendFetch<BackendDashboard>(`/dashboard?limit=${limit}`);
 }
 
@@ -178,8 +278,13 @@ export interface DrainCluster {
   examples: string[];
 }
 
-export async function clusterDrainLogs(content: string): Promise<DrainCluster[]> {
-  const data = await backendFetch<{ clusters: DrainCluster[] }>("/drain/cluster", jsonInit("POST", { content }));
+export async function clusterDrainLogs(
+  content: string,
+): Promise<DrainCluster[]> {
+  const data = await backendFetch<{ clusters: DrainCluster[] }>(
+    "/drain/cluster",
+    jsonInit("POST", { content }),
+  );
   return data.clusters ?? [];
 }
 
@@ -201,20 +306,24 @@ const TRANSPORT_TO_UI: Record<string, SourceTransportId> = {
   udp: "syslog_udp",
   http: "http_collect",
   file: "file_agent",
+  sse: "sse_stream",
   other: "custom_api",
+  kafka_sim: "kafka_sim",
 };
 
 const TRANSPORT_ENDPOINT: Record<string, string> = {
-  udp: "514",
-  http: "/api/normalize",
+  udp: "1514/udp",
+  http: "http://localhost:8081/logs",
   file: "/var/lib/ulpf/uploads",
-  other: "/api/normalize",
+  sse: "https://<upstream-host>/events",
+  other: "http://localhost:8081/logs",
 };
 
 const DEFAULT_CHAIN: Record<string, string[]> = {
   syslog_udp: ["Syslog Parser", "Key/Value Parser", "Text Parser"],
   syslog_tcp: ["Syslog Parser", "Key/Value Parser", "Text Parser"],
   http_collect: ["JSON Parser", "Key/Value Parser", "Text Parser"],
+  sse_stream: ["JSON Parser", "Key/Value Parser", "Text Parser"],
   file_agent: ["Format auto-detect", "Primary chain · set on first import"],
   custom_api: ["JSON Parser", "Key/Value Parser", "Text Parser"],
 };
@@ -249,18 +358,32 @@ export function backendSourceToUi(doc: BackendSourceDoc): Source {
 // Backend → UI event adapters
 // ---------------------------------------------------------------------------
 
-export const SEVERITY_IDS: Record<string, number> = { low: 2, medium: 3, high: 4, critical: 5 };
-
-const CLASS_TABLE: Record<string, { class_uid: number; category_uid: number }> = {
-  system_activity: { class_uid: 1007, category_uid: 1 },
-  security_activity: { class_uid: 2002, category_uid: 2 },
-  application_activity: { class_uid: 6001, category_uid: 6 },
+export const SEVERITY_IDS: Record<string, number> = {
+  low: 2,
+  medium: 3,
+  high: 4,
+  critical: 5,
 };
 
-const SEVERITY_DISPLAY: Record<string, string> = { low: "low", medium: "medium", high: "high", critical: "critical" };
+const CLASS_TABLE: Record<string, { class_uid: number; category_uid: number }> =
+  {
+    system_activity: { class_uid: 1007, category_uid: 1 },
+    security_activity: { class_uid: 2002, category_uid: 2 },
+    application_activity: { class_uid: 6001, category_uid: 6 },
+  };
+
+const SEVERITY_DISPLAY: Record<string, string> = {
+  low: "low",
+  medium: "medium",
+  high: "high",
+  critical: "critical",
+};
 
 export function backendEventToOcsf(be: BackendNormalizedEvent): OcsfEvent {
-  const cls = CLASS_TABLE[be.class_name ?? ""] ?? { class_uid: 0, category_uid: 0 };
+  const cls = CLASS_TABLE[be.class_name ?? ""] ?? {
+    class_uid: 0,
+    category_uid: 0,
+  };
   const severityRaw = (be.severity ?? "").toLowerCase();
   const severityId = SEVERITY_IDS[severityRaw] ?? 0;
   const time = typeof be.time === "string" ? Date.parse(be.time) : be.time;
@@ -281,13 +404,17 @@ export function backendEventToOcsf(be: BackendNormalizedEvent): OcsfEvent {
     severity_id: severityId,
     severity: severityRaw ? SEVERITY_DISPLAY[severityRaw] : undefined,
     status_id: undefined,
-    message: be.app_id ? `${be.app_id}${be.user ? ` · ${be.user}` : ""}${be.action ? ` · ${be.action}` : ""}` : undefined,
+    message: be.app_id
+      ? `${be.app_id}${be.user ? ` · ${be.user}` : ""}${be.action ? ` · ${be.action}` : ""}`
+      : undefined,
     src_endpoint: src,
     dst_endpoint: dst,
     user: be.user ? { name: be.user } : undefined,
     device: be.device_id ? { hostname: be.device_id } : undefined,
     app_name: be.app_id ?? undefined,
-    connection_info: be.protocol_name ? { protocol_name: be.protocol_name } : undefined,
+    connection_info: be.protocol_name
+      ? { protocol_name: be.protocol_name }
+      : undefined,
     raw_data: undefined,
     metadata: { version: "1.3.0" },
     extensions: {
@@ -301,13 +428,16 @@ export function backendEventToOcsf(be: BackendNormalizedEvent): OcsfEvent {
   };
 }
 
-export function backendEventToLineResult(be: BackendNormalizedEvent, index: number): NormalizedEventResult {
+export function backendEventToLineResult(
+  be: BackendNormalizedEvent,
+  index: number,
+): NormalizedEventResult {
   return {
     ok: true,
     event: backendEventToOcsf(be),
     source_line: "",
     line_number: index + 1,
-    format: be.extensions?.format_hint as string | undefined ?? "unknown",
+    format: (be.extensions?.format_hint as string | undefined) ?? "unknown",
     parser: be.parser_id,
     parser_chain: [be.parser_tier],
     chain_rescued: be.parser_tier === "fallback",
@@ -315,7 +445,17 @@ export function backendEventToLineResult(be: BackendNormalizedEvent, index: numb
   };
 }
 
-export function backendDlqToRejected(rec: BackendDlqRecord, index: number): RejectedEventResult {
+export function backendEventSourceId(
+  event: BackendNormalizedEvent,
+): string | undefined {
+  const value = event.extensions?.source_id;
+  return value === undefined || value === null ? undefined : String(value);
+}
+
+export function backendDlqToRejected(
+  rec: BackendDlqRecord,
+  index: number,
+): RejectedEventResult {
   return {
     ok: false,
     reason: rec.classification ?? rec.status,

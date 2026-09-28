@@ -1,28 +1,19 @@
-import { useMemo, useState } from "react";
-import { Ban, Check, CheckCircle2, Download, FileText, Info, LifeBuoy, ScrollText, X } from "lucide-react";
-import type { OcsfEvent } from "@shared/api";
+import { useMemo } from "react";
+import { Link } from "react-router-dom";
+import { ArrowRight, Ban, Check, CheckCircle2, Download, FileText, Info, LifeBuoy, ScrollText } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { StatChip } from "@/components/common/bits";
 import EventTable from "@/components/events/EventTable";
-import JsonViewer from "@/components/events/JsonViewer";
+import RejectedLines from "@/components/events/RejectedLines";
 import { isEvent, isRejected } from "@/lib/guards";
 import { useNormalizer } from "@/lib/normalize-context";
 
 export default function ResultsView() {
   const { result } = useNormalizer();
-  const [selectedIndex, setSelectedIndex] = useState(0);
 
   const normalized = useMemo(() => (result ? result.lines.filter(isEvent) : []), [result]);
   const rejected = useMemo(() => (result ? result.lines.filter(isRejected) : []), [result]);
-
-  const selected = selectedIndex < normalized.length ? normalized[selectedIndex] : undefined;
-  const selectedEvent: OcsfEvent | null = selected?.event ?? null;
-
-  const timeLabel = (ev: OcsfEvent) => {
-    if (!ev.time || (ev.metadata.labels ?? []).includes("no_timestamp_in_source")) return "no timestamp in source";
-    return new Date(ev.time).toISOString();
-  };
 
   if (!result) return null;
 
@@ -82,47 +73,30 @@ export default function ResultsView() {
           ))}
       </div>
 
-      <div className="mt-8 grid gap-5 lg:grid-cols-[minmax(0,1.15fr)_minmax(0,0.85fr)]">
-        <section>
-          <h2 className="mb-2 flex items-center gap-2 text-base font-bold tracking-tight">
-            <CheckCircle2 className="h-4 w-4 text-emerald-500" />
-            Normalized events
-            <span className="text-sm font-normal text-muted-foreground">({normalized.length})</span>
-          </h2>
-          <EventTable events={normalized} selectedIndex={selectedIndex} onSelect={setSelectedIndex} emptyMessage="No events were produced — check the rejected lines below." />
-        </section>
-        <section>
-          <JsonViewer event={selectedEvent} lineNumber={selected?.line_number} footnote={selectedEvent ? timeLabel(selectedEvent) : undefined} />
-        </section>
+      <div className="mt-8 flex flex-wrap items-center justify-between gap-3">
+        <h2 className="flex items-center gap-2 text-base font-bold tracking-tight">
+          <CheckCircle2 className="h-4 w-4 text-emerald-500" />
+          Normalized logs
+          <span className="text-sm font-normal text-muted-foreground">({normalized.length})</span>
+        </h2>
+        <Button asChild variant="outline" size="sm">
+          <Link to="/events/normalized">
+            Open events <ArrowRight className="h-3.5 w-3.5" />
+          </Link>
+        </Button>
+      </div>
+
+      <div className="mt-3">
+        <EventTable
+          events={normalized}
+          heightClass="max-h-[70vh]"
+          showFilter
+          emptyMessage="No events were produced — check the rejected lines below."
+        />
       </div>
 
       <div className="mt-8">
-        <h2 className="mb-2 flex items-center gap-2 text-base font-bold tracking-tight">
-          <X className="h-4 w-4 text-rose-500" />
-          Rejected lines
-          <span className="text-sm font-normal text-muted-foreground">({rejected.length})</span>
-        </h2>
-        <div className="max-h-64 overflow-y-auto rounded-lg border border-border bg-card">
-          {rejected.length === 0 && (
-            <div className="flex items-center gap-2 px-4 py-3 text-sm text-muted-foreground">
-              <CheckCircle2 className="h-4 w-4 text-emerald-500" />
-              Everything parsed cleanly — nothing rejected.
-            </div>
-          )}
-          {rejected.map((r) => (
-            <div key={r.line_number} className="flex gap-3 border-b border-border px-3 py-2.5 last:border-0">
-              <span className="w-10 shrink-0 font-mono text-[10px] text-muted-foreground">#{r.line_number}</span>
-              <div className="min-w-0 flex-1">
-                <div className="flex flex-wrap items-center gap-2">
-                  <Badge variant="destructive" className="px-1.5 py-0.5 text-[10px]">
-                    {r.reason}
-                  </Badge>
-                </div>
-                {r.line && <p className="mt-1 line-clamp-1 font-mono text-[11px] text-muted-foreground">{r.line}</p>}
-              </div>
-            </div>
-          ))}
-        </div>
+        <RejectedLines rejected={rejected} />
       </div>
     </>
   );
