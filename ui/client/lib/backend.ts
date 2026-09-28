@@ -67,6 +67,19 @@ export interface BackendNormalizedEvent {
   extensions?: Record<string, unknown>;
 }
 
+/**
+ * One resolved replay attempt, appended to the DLQ record by the API and
+ * never rewritten. `attempt` is derived server-side from the record's own
+ * counter, so it stays correct across separate runs.
+ */
+export interface DlqAttemptEntry {
+  attempt: number;
+  reprocess_id?: string | null;
+  started_at: string;
+  result: "recovered" | "failed";
+  reason?: string | null;
+}
+
 export interface BackendDlqRecord {
   dlq_id: string;
   raw_event_id: string;
@@ -78,6 +91,14 @@ export interface BackendDlqRecord {
   last_attempt_at: string;
   reprocess_count: number;
   metadata?: Record<string, unknown>;
+  // Module 3 recovery audit. `status` above is the ORIGINAL failure
+  // classification and is never overwritten -- "was this event originally a
+  // failure?" must stay answerable after a successful replay.
+  resolution_status?: "unresolved" | "recovered";
+  resolved_at?: string | null;
+  last_reprocess_id?: string | null;
+  replay_reason?: string | null;
+  attempt_history?: DlqAttemptEntry[];
 }
 
 export interface BackendDashboard {
@@ -260,6 +281,179 @@ export async function listBackendDlq(
   return backendFetch<{ total: number; records: BackendDlqRecord[] }>(
     `/dlq?limit=${limit}`,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Module 3: reprocessing
+//
+// The browser never parses. It asks the API to republish the original Bronze
+// event onto logs.raw, then polls for the orchestrator's verdict. Every
+// "recovered" claim below therefore comes from the pipeline, not from a
+// re-run of the local normalizer.
+// ---------------------------------------------------------------------------
+
+export type ReprocessStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "partial"
+  | "failed";
+
+export interface ReprocessRunError {
+  dlq_id: string;
+  detail: string;
+}
+
+/** Mirrors ReprocessRun / serialize_run() on the Python side. */
+export interface ReprocessRun {
+  reprocess_id: string;
+  status: ReprocessStatus;
+  requested_count: number;
+  published_count: number;
+  recovered_count: number;
+  failed_count: number;
+  reason?: string | null;
+  dlq_ids: string[];
+  event_ids: string[];
+  errors: ReprocessRunError[];
+  created_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  /** Only on the response of POST /dlq/{id}/reprocess. */
+  dlq_id?: string;
+}
+
+export interface DryRunPreview {
+  dlq_id: string;
+  dry_run: true;
+  would_succeed: boolean;
+  /**
+   * True when the verdict depends on the orchestrator's live Drain3 miner,
+   * which this process cannot see. A real replay may still recover it, so a
+   * false here is NOT a death sentence.
+   */
+  drain3_dependent?: boolean;
+  note?: string | null;
+  parsers_attempted?: string[];
+  previous_parsers_attempted?: string[];
+  normalized_preview?: unknown;
+  error?: string;
+}
+
+export interface BatchDryRunResult {
+  dry_run: true;
+  requested: number;
+  would_succeed: number;
+  drain3_dependent: number;
+  results: DryRunPreview[];
+}
+
+const TERMINAL_STATUSES: ReadonlySet<ReprocessStatus> = new Set([
+  "completed",
+  "partial",
+  "failed",
+]);
+
+export function isReprocessTerminal(status: ReprocessStatus): boolean {
+  return TERMINAL_STATUSES.has(status);
+}
+
+/**
+ * Ids are always explicit. The API deliberately has no "reprocess everything
+ * matching a filter" mode, and the UI must not reintroduce one: a bulk replay
+ * that silently picks its own targets is unreviewable.
+ */
+export async function reprocessDlqBatch(
+  dlqIds: string[],
+  reason?: string,
+): Promise<ReprocessRun> {
+  return backendFetch<ReprocessRun>(
+    "/dlq/reprocess",
+    jsonInit("POST", { dlq_ids: dlqIds, reason: reason ?? null }),
+  );
+}
+
+export async function reprocessDlqRecord(
+  dlqId: string,
+  reason?: string,
+): Promise<ReprocessRun> {
+  return backendFetch<ReprocessRun>(
+    `/dlq/${encodeURIComponent(dlqId)}/reprocess`,
+    jsonInit("POST", { reason: reason ?? null }),
+  );
+}
+
+/**
+ * Preview a replay without publishing anything, so a batch decision can be
+ * made on evidence rather than hope.
+ */
+export async function previewReprocessBatch(
+  dlqIds: string[],
+): Promise<BatchDryRunResult> {
+  return backendFetch<BatchDryRunResult>(
+    "/dlq/reprocess?dry_run=true",
+    jsonInit("POST", { dlq_ids: dlqIds, reason: null, dry_run: true }),
+  );
+}
+
+export async function getReprocessRun(
+  reprocessId: string,
+): Promise<ReprocessRun> {
+  return backendFetch<ReprocessRun>(
+    `/reprocess/${encodeURIComponent(reprocessId)}`,
+  );
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    function onAbort() {
+      clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+export interface PollReprocessOptions {
+  signal?: AbortSignal;
+  intervalMs?: number;
+  timeoutMs?: number;
+  onUpdate?: (run: ReprocessRun) => void;
+}
+
+/**
+ * Follow a run to a terminal status.
+ *
+ * Returns the last observed run on timeout rather than throwing, so a stuck
+ * run still shows the operator its real counters instead of an error. Only
+ * "completed", "partial" and "failed" are terminal -- a run stays "running"
+ * until the orchestrator has tallied an outcome for every published event, so
+ * polling must not stop early or it will report 0 recovered for a run that is
+ * about to succeed.
+ */
+export async function pollReprocessRun(
+  reprocessId: string,
+  opts: PollReprocessOptions = {},
+): Promise<ReprocessRun> {
+  const { signal, intervalMs = 1500, timeoutMs = 120_000, onUpdate } = opts;
+  const deadline = Date.now() + timeoutMs;
+  let run = await getReprocessRun(reprocessId);
+  onUpdate?.(run);
+  while (!isReprocessTerminal(run.status)) {
+    if (Date.now() >= deadline) return run;
+    await sleep(intervalMs, signal);
+    run = await getReprocessRun(reprocessId);
+    onUpdate?.(run);
+  }
+  return run;
 }
 
 export async function getBackendDashboard(
@@ -462,5 +656,8 @@ export function backendDlqToRejected(
     line: rec.raw_payload ?? null,
     line_number: index + 1,
     tried_parsers: rec.parsers_attempted ?? [],
+    // Carries the real identity through the shared display shape so a
+    // reprocess request addresses the record, not its row index.
+    dlq_id: rec.dlq_id,
   };
 }

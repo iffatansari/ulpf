@@ -97,6 +97,16 @@ export interface RejectedEventResult {
   line: string | null;
   line_number: number;
   tried_parsers?: string[];
+  /**
+   * Stable identity of the quarantined record, present only for records that
+   * came from the backend DLQ.
+   *
+   * `line_number` is a display position within whatever list produced it and
+   * changes when the list is re-sorted or re-fetched, so it must never be
+   * used to address a reprocess request -- that would replay whichever record
+   * happened to land in that slot. Local sample runs have no dlq_id.
+   */
+  dlq_id?: string;
 }
 
 export type LineResult = NormalizedEventResult | RejectedEventResult;
