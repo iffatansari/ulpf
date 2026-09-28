@@ -359,3 +359,232 @@ def test_every_supported_token_maps_into_the_four_level_vocabulary():
 	assert {level for _, level in SEVERITY_KEYWORDS} <= set(SEVEREITY_ORDER)
 
 
+# ---------------------------------------------------------------------------
+# RFC 5424
+#
+# The parser only ever implemented the BSD/RFC 3164 dialect: SYSLOG_PATTERN
+# requires a "Mon DD HH:MM:SS" timestamp and a colon after the program name,
+# neither of which RFC 5424 has. RFC 5424 is what systemd, rsyslog >= 8 and
+# every container runtime emit by default, so those lines were falling through
+# the whole probe into the DLQ while the UI advertised 5424 support.
+#
+#   <PRI>VERSION SP TIMESTAMP SP HOSTNAME SP APP-NAME SP PROCID SP MSGID
+#   SP STRUCTURED-DATA [SP MSG]
+# ---------------------------------------------------------------------------
+
+
+def test_rfc5424_line_advertised_by_the_ui_parses():
+	# The exact example ui/client/lib/parser-meta.ts presents as this
+	# parser's signature input.
+	event = parse_syslog(
+		'<34>1 2024-01-22T12:42:48Z web1 sshd 2321 - - "Failed password for admin"',
+		raw_event_id="raw-5424-1",
+		source_id="syslog-source-1",
+	)
+
+	assert event is not None
+	assert event.parser_id == "syslog-parser-v1"
+	assert event.severity == "critical"
+	assert event.device_id == "web1"
+	assert event.app_id == "sshd"
+	assert event.extensions["syslog_pid"] == 2321
+	# MSG is free text in RFC 5424, so the quotes are literal content.
+	assert event.extensions["syslog_message"] == '"Failed password for admin"'
+	assert (event.time.year, event.time.month, event.time.day) == (2024, 1, 22)
+
+
+def test_rfc5424_severity_from_pri_wins_over_message_keywords():
+	event = parse_syslog(
+		"<38>1 2024-01-22T12:42:48Z web1 CRON 2321 - - session opened",
+		raw_event_id="raw-5424-2",
+		source_id="syslog-source-1",
+	)
+
+	assert event is not None
+	assert event.severity == "low"
+	assert event.app_id == "CRON"
+
+
+def test_rfc5424_timestamp_is_normalized_to_utc():
+	event = parse_syslog(
+		"<34>1 2023-11-05T06:07:08.123+02:00 web1 sshd 2321 - - login failed",
+		raw_event_id="raw-5424-3",
+		source_id="syslog-source-1",
+	)
+
+	assert event is not None
+	# NormalizedEvent.time is documented as UTC.
+	assert event.time.utcoffset().total_seconds() == 0
+	# 06:07:08 at +02:00 is 04:07:08Z.
+	assert (event.time.hour, event.time.minute, event.time.second) == (4, 7, 8)
+	assert event.time.microsecond == 123000
+	assert event.time.year == 2023
+
+
+def test_rfc5424_nilvalues_do_not_leak_literal_dashes():
+	# "-" is RFC 5424's NILVALUE, meaning "absent". Reporting it as a real
+	# hostname or pid puts a garbage "-" into every OCSF field it touches.
+	event = parse_syslog(
+		"<34>1 2024-01-22T12:42:48Z - - - - -",
+		raw_event_id="raw-5424-4",
+		source_id="syslog-source-1",
+	)
+
+	assert event is not None
+	assert event.device_id is None
+	assert event.app_id is None
+	assert "syslog_pid" not in event.extensions
+	assert "syslog_msgid" not in event.extensions
+	assert "syslog_structured_data" not in event.extensions
+	# All five trailing fields are NILVALUE: the 4 remaining header fields
+	# plus the STRUCTURED-DATA placeholder. MSG is therefore absent, not the
+	# literal string "-". The key stays present so the extension shape is
+	# stable for downstream consumers.
+	assert event.extensions["syslog_message"] == ""
+
+
+def test_rfc5424_keeps_a_literal_dash_message_intact():
+	# Same line as above but with a sixth NILVALUE, which per RFC 5424 is a
+	# MSG whose content really is "-". The placeholder must only swallow the
+	# one token that introduces STRUCTURED-DATA.
+	event = parse_syslog(
+		"<34>1 2024-01-22T12:42:48Z - - - - - -",
+		raw_event_id="raw-5424-4b",
+		source_id="syslog-source-1",
+	)
+
+	assert event is not None
+	assert event.extensions["syslog_message"] == "-"
+
+
+def test_rfc5424_nil_timestamp_falls_back_to_ingest_time():
+	event = parse_syslog(
+		"<34>1 - web1 sshd 2321 - - login failed",
+		raw_event_id="raw-5424-5",
+		source_id="syslog-source-1",
+	)
+
+	assert event is not None
+	assert event.time is not None
+	assert event.extensions["syslog_message"] == "login failed"
+
+
+def test_rfc5424_structured_data_is_flattened_into_extensions():
+	event = parse_syslog(
+		'<34>1 2024-01-22T12:42:48Z web1 sshd 2321 ID47 '
+		'[exampleSDID@32473 iut="3" eventSource="Application" eventID="1011"] '
+		"Failed password for admin",
+		raw_event_id="raw-5424-6",
+		source_id="syslog-source-1",
+	)
+
+	assert event is not None
+	sd = event.extensions["syslog_structured_data"]
+	assert sd["sd_id"] == "exampleSDID@32473"
+	assert sd["iut"] == "3"
+	assert sd["eventSource"] == "Application"
+	assert sd["eventID"] == "1011"
+	assert event.extensions["syslog_msgid"] == "ID47"
+	assert event.extensions["syslog_message"] == "Failed password for admin"
+
+
+def test_rfc5424_supports_multiple_structured_data_elements():
+	event = parse_syslog(
+		'<13>1 2024-01-22T12:42:48Z web1 sshd 2321 ID47 '
+		'[a@1 k="1"][b@2 k="2"] hello',
+		raw_event_id="raw-5424-7",
+		source_id="syslog-source-1",
+	)
+
+	assert event is not None
+	sd = event.extensions["syslog_structured_data"]
+	assert sd["sd_id"] == "a@1"
+	assert sd["k"] == "1"
+	assert event.extensions["syslog_message"] == "hello"
+
+
+def test_rfc5424_structured_data_value_may_contain_a_bracket():
+	# A naive "\[.*?\]" would cut the element short and corrupt the message.
+	event = parse_syslog(
+		'<13>1 2024-01-22T12:42:48Z web1 sshd 2321 - [a@1 note="a]b"] tail',
+		raw_event_id="raw-5424-8",
+		source_id="syslog-source-1",
+	)
+
+	assert event is not None
+	sd = event.extensions["syslog_structured_data"]
+	assert sd["note"] == "a]b"
+	assert event.extensions["syslog_message"] == "tail"
+
+
+def test_rfc5424_structured_data_value_may_contain_escaped_quotes():
+	event = parse_syslog(
+		'<13>1 2024-01-22T12:42:48Z web1 sshd 2321 - [a@1 why="say \\"hi\\""] tail',
+		raw_event_id="raw-5424-9",
+		source_id="syslog-source-1",
+	)
+
+	assert event is not None
+	assert event.extensions["syslog_structured_data"]["why"] == 'say "hi"'
+	assert event.extensions["syslog_message"] == "tail"
+
+
+def test_rfc5424_strips_a_leading_byte_order_mark():
+	# RFC 5424 section 6.4.1 allows a sender to prefix MSG with a UTF-8 BOM.
+	event = parse_syslog(
+		"<13>1 2024-01-22T12:42:48Z web1 sshd 2321 - - \ufeffhello",
+		raw_event_id="raw-5424-10",
+		source_id="syslog-source-1",
+	)
+
+	assert event is not None
+	assert event.extensions["syslog_message"] == "hello"
+
+
+def test_rfc5424_keeps_non_ascii_messages_intact():
+	event = parse_syslog(
+		"<13>1 2024-01-22T12:42:48Z web1 sshd 2321 - - échec de connexion utilisateur",
+		raw_event_id="raw-5424-11",
+		source_id="syslog-source-1",
+	)
+
+	assert event is not None
+	assert event.extensions["syslog_message"] == "échec de connexion utilisateur"
+
+
+def test_rfc3164_dialect_is_still_parsed_after_adding_5424():
+	# Regression guard: the two dialects must not shadow each other.
+	event = parse_syslog(
+		"<34>Sep 16 18:40:00 test-server sshd[2211]: Accepted password for alice",
+		raw_event_id="raw-3164-1",
+		source_id="syslog-source-1",
+	)
+
+	assert event is not None
+	assert event.app_id == "sshd"
+	assert event.extensions["syslog_pid"] == 2211
+	assert event.extensions["syslog_message"] == "Accepted password for alice"
+
+
+def test_prose_is_still_rejected_so_the_fallback_keeps_its_turn():
+	event = parse_syslog(
+		"2024-01-22T12:42:48Z api-gateway login for user bob failed: bad password",
+		raw_event_id="raw-not-syslog",
+		source_id="syslog-source-1",
+	)
+
+	assert event is None
+
+
+def test_wrong_5424_version_is_not_claimed_as_syslog():
+	# RFC 5424 is VERSION 1. A different version has an unknown header shape,
+	# so guessing would corrupt fields.
+	event = parse_syslog(
+		"<34>2 2024-01-22T12:42:48Z web1 sshd 2321 - - hello",
+		raw_event_id="raw-5424-badversion",
+		source_id="syslog-source-1",
+	)
+
+	assert event is None
+
+
