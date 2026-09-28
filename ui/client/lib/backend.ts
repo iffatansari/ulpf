@@ -135,6 +135,125 @@ function jsonInit(method: string, body?: unknown): RequestInit {
 }
 
 // ---------------------------------------------------------------------------
+// Parser registry
+//
+// The registry on the API is the source of truth for which parsers exist and
+// in what order they are tried. The UI never invents a parser list: the ids
+// here are the ones the orchestrator really runs.
+// ---------------------------------------------------------------------------
+
+export type ParserStatus = "active" | "disabled" | "draft";
+
+export interface BackendParserFieldRule {
+  name: string;
+  pattern: string;
+}
+
+export interface BackendParserDoc {
+  parser_id: string;
+  display_name: string;
+  description?: string | null;
+  status: ParserStatus;
+  priority: number;
+  version: number;
+  is_builtin: boolean;
+  source_formats?: string[];
+  field_rules?: BackendParserFieldRule[];
+  sample_payload?: string | null;
+  history?: unknown[];
+  last_test?: BackendParserTestResult | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface BackendParserTestResult {
+  parser_id: string;
+  matched: boolean;
+  /** Present for built-ins: the normalized event the real parser produced. */
+  event?: Record<string, unknown> | null;
+  /** Present for custom parsers: what the declarative field rules extracted. */
+  extracted?: Record<string, string>;
+  error?: string | null;
+  /** Why a parser declined a sample, or what kind of result this is. */
+  reason?: string | null;
+  errors?: string[];
+  tested_at?: string;
+}
+
+export async function listBackendParsers(
+  includeDisabled = false,
+): Promise<BackendParserDoc[]> {
+  const data = await backendFetch<{ parsers: BackendParserDoc[] }>(
+    `/parsers?include_disabled=${includeDisabled}`,
+  );
+  return data.parsers ?? [];
+}
+
+export async function getBackendParser(
+  parserId: string,
+): Promise<BackendParserDoc> {
+  return backendFetch<BackendParserDoc>(`/parsers/${parserId}`);
+}
+
+export interface BackendParserCreate {
+  parser_id: string;
+  display_name: string;
+  description?: string;
+  status?: ParserStatus;
+  priority?: number;
+  source_formats?: string[];
+  field_rules?: BackendParserFieldRule[];
+  sample_payload?: string;
+}
+
+export async function createBackendParser(
+  payload: BackendParserCreate,
+): Promise<BackendParserDoc> {
+  return backendFetch<BackendParserDoc>("/parsers", jsonInit("POST", payload));
+}
+
+export async function updateBackendParser(
+  parserId: string,
+  changes: Partial<Omit<BackendParserCreate, "parser_id">>,
+): Promise<BackendParserDoc> {
+  return backendFetch<BackendParserDoc>(
+    `/parsers/${parserId}`,
+    jsonInit("PUT", changes),
+  );
+}
+
+export async function rollbackBackendParser(
+  parserId: string,
+): Promise<BackendParserDoc> {
+  return backendFetch<BackendParserDoc>(
+    `/parsers/${parserId}/rollback`,
+    jsonInit("POST"),
+  );
+}
+
+export async function deleteBackendParser(parserId: string): Promise<void> {
+  await backendFetch<{ deleted: string }>(
+    `/parsers/${parserId}`,
+    jsonInit("DELETE"),
+  );
+}
+
+/**
+ * Run a sample through a real parser on the API. This is the whole point of
+ * the endpoint: a built-in runs the orchestrator's own callable, so the
+ * answer is what the pipeline would actually do.
+ */
+export async function testBackendParser(
+  parserId: string,
+  sample: string,
+): Promise<BackendParserTestResult> {
+  return backendFetch<BackendParserTestResult>(
+    "/parsers/test",
+    jsonInit("POST", { parser_id: parserId, sample }),
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Sources registry
 // ---------------------------------------------------------------------------
 
@@ -185,7 +304,9 @@ export async function deleteBackendSource(sourceId: string): Promise<void> {
 export async function getBackendSourceStats(
   sourceId: string,
 ): Promise<SourceStats> {
-  return backendFetch<SourceStats>(`/sources/${sourceId}/stats`);
+  return backendFetch<SourceStats>(
+    `/sources/${encodeURIComponent(sourceId)}/stats`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -205,7 +326,7 @@ export async function getBackendSourceEvents(
   limit = 50,
 ): Promise<{ total: number; events: BackendNormalizedEvent[] }> {
   return backendFetch<{ total: number; events: BackendNormalizedEvent[] }>(
-    `/sources/${sourceId}/events?limit=${limit}`,
+    `/sources/${encodeURIComponent(sourceId)}/events?limit=${limit}`,
   );
 }
 

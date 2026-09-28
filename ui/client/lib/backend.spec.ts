@@ -1,13 +1,18 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   backendDlqToRejected,
+  getBackendSourceEvents,
+  getBackendSourceStats,
   isReprocessTerminal,
   listBackendDlq,
+  mergeBackendEvents,
   pollReprocessRun,
   previewReprocessBatch,
   reprocessDlqBatch,
   reprocessDlqRecord,
+  subscribeToBackendEvents,
   type BackendDlqRecord,
+  type BackendNormalizedEvent,
   type ReprocessRun,
 } from "./backend";
 
@@ -160,5 +165,234 @@ describe("DLQ display adapter", () => {
       dlq_id: "dlq-1",
       tried_parsers: ["syslog-v1", "json-v1"],
     });
+  });
+});
+
+/**
+ * The live event stream and the source-scoped history both feed the same list,
+ * so they have to agree on how a source is addressed: an id goes in the path
+ * for history and in a query parameter for the stream. Getting that wrong
+ * silently shows every source's events on a single source's page.
+ */
+describe("source-scoped event reads", () => {
+  it("addresses source history by id in the path, encoded", async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit) =>
+        jsonResponse({ total: 0, events: [] }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await getBackendSourceEvents("src web/1", 10);
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/backend/sources/src%20web%2F1/events?limit=10");
+  });
+
+  it("addresses source stats by the same encoded path segment", async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit) => jsonResponse({ source_id: "src web/1" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await getBackendSourceStats("src web/1");
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/backend/sources/src%20web%2F1/stats");
+  });
+
+  it("addresses the event stream by id in a query parameter, encoded", () => {
+    const streams: FakeEventSource[] = [];
+    vi.stubGlobal("window", {});
+    vi.stubGlobal(
+      "EventSource",
+      class extends FakeEventSource {
+        constructor(url: string) {
+          super(url);
+          streams.push(this);
+        }
+      },
+    );
+
+    subscribeToBackendEvents("src web/1", { onEvent: () => {} });
+
+    expect(streams[0].url).toBe("/backend/events/stream?source_id=src%20web%2F1");
+  });
+
+  it("subscribes to the unscoped stream when no source is selected", () => {
+    const streams: FakeEventSource[] = [];
+    vi.stubGlobal("window", {});
+    vi.stubGlobal(
+      "EventSource",
+      class extends FakeEventSource {
+        constructor(url: string) {
+          super(url);
+          streams.push(this);
+        }
+      },
+    );
+
+    subscribeToBackendEvents(undefined, { onEvent: () => {} });
+
+    expect(streams[0].url).toBe("/backend/events/stream");
+  });
+});
+
+class FakeEventSource {
+  url: string;
+  onopen: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  private listeners = new Map<string, Set<(event: Event) => void>>();
+
+  constructor(url: string) {
+    this.url = url;
+  }
+
+  addEventListener(type: string, handler: (event: Event) => void) {
+    if (!this.listeners.has(type)) this.listeners.set(type, new Set());
+    this.listeners.get(type)!.add(handler);
+  }
+
+  removeEventListener(type: string, handler: (event: Event) => void) {
+    this.listeners.get(type)?.delete(handler);
+  }
+
+  emit(type: string, data: string) {
+    for (const handler of this.listeners.get(type) ?? []) {
+      handler({ data } as MessageEvent<string>);
+    }
+  }
+
+  listenerCount(type: string): number {
+    return this.listeners.get(type)?.size ?? 0;
+  }
+
+  close() {}
+}
+
+function event(over: Partial<BackendNormalizedEvent> = {}): BackendNormalizedEvent {
+  return {
+    event_id: "evt-1",
+    raw_event_id: "bronze-1",
+    parser_id: "json-parser-v1",
+    time: "2026-09-27T10:00:00Z",
+    class_name: "security_activity",
+    ...over,
+  } as BackendNormalizedEvent;
+}
+
+describe("SSE event handling", () => {
+  function fakeStream(sourceId: string | undefined) {
+    let created: FakeEventSource | null = null;
+    // The client guards on window existing, and vitest runs these in node, so
+    // both the guard and the constructor have to be stubbed to reach the code
+    // under test.
+    vi.stubGlobal("window", {});
+    vi.stubGlobal(
+      "EventSource",
+      class extends FakeEventSource {
+        constructor(url: string) {
+          super(url);
+          created = this;
+        }
+      },
+    );
+    const handlers = {
+      onEvent: vi.fn(),
+      onOpen: vi.fn(),
+      onError: vi.fn(),
+      onReset: vi.fn(),
+    };
+    subscribeToBackendEvents(sourceId, handlers);
+    return { stream: created as unknown as FakeEventSource, handlers };
+  }
+
+  it("delivers a normalized event to onEvent", () => {
+    const { stream, handlers } = fakeStream("src-1");
+
+    stream.emit("normalized", JSON.stringify(event()));
+
+    expect(handlers.onEvent).toHaveBeenCalledWith(event());
+  });
+
+  it("ignores a payload that is not a usable event instead of throwing", () => {
+    const { stream, handlers } = fakeStream("src-1");
+
+    stream.emit("normalized", JSON.stringify({ nope: true }));
+
+    expect(handlers.onEvent).not.toHaveBeenCalled();
+    expect(handlers.onError).not.toHaveBeenCalled();
+  });
+
+  it("reports malformed JSON as a stream error", () => {
+    const { stream, handlers } = fakeStream("src-1");
+
+    stream.emit("normalized", "{not json");
+
+    expect(handlers.onEvent).not.toHaveBeenCalled();
+    expect(handlers.onError).toHaveBeenCalled();
+  });
+
+  it("maps a reset event to onReset so the UI can refetch", () => {
+    const { stream, handlers } = fakeStream("src-1");
+
+    stream.emit("reset", "{}");
+
+    expect(handlers.onReset).toHaveBeenCalled();
+  });
+
+  it("detaches its listeners and closes the stream on unsubscribe", () => {
+    let created: FakeEventSource | null = null;
+    vi.stubGlobal("window", {});
+    vi.stubGlobal(
+      "EventSource",
+      class extends FakeEventSource {
+        constructor(url: string) {
+          super(url);
+          created = this;
+        }
+      },
+    );
+
+    const unsubscribe = subscribeToBackendEvents("src-1", { onEvent: () => {} });
+    const stream = created as unknown as FakeEventSource;
+    expect(stream.listenerCount("normalized")).toBe(1);
+
+    unsubscribe();
+
+    expect(stream.listenerCount("normalized")).toBe(0);
+    expect(stream.listenerCount("reset")).toBe(0);
+  });
+});
+
+describe("merging streamed events into the visible list", () => {
+  it("orders newest first across both sources", () => {
+    const merged = mergeBackendEvents(
+      [event({ event_id: "old", time: "2026-09-27T09:00:00Z" })],
+      [event({ event_id: "new", time: "2026-09-27T11:00:00Z" })],
+    );
+
+    expect(merged.map((e) => e.event_id)).toEqual(["new", "old"]);
+  });
+
+  it("dedupes by event_id, letting the incoming copy win", () => {
+    const merged = mergeBackendEvents(
+      [event({ parser_id: "syslog-parser-v1" })],
+      [event({ parser_id: "json-parser-v1" })],
+    );
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0].parser_id).toBe("json-parser-v1");
+  });
+
+  it("caps the list at the limit, keeping the newest", () => {
+    const merged = mergeBackendEvents(
+      [],
+      [
+        event({ event_id: "a", time: "2026-09-27T09:00:00Z" }),
+        event({ event_id: "b", time: "2026-09-27T11:00:00Z" }),
+        event({ event_id: "c", time: "2026-09-27T10:00:00Z" }),
+      ],
+      2,
+    );
+
+    expect(merged.map((e) => e.event_id)).toEqual(["b", "c"]);
   });
 });

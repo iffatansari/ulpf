@@ -19,6 +19,8 @@ from routes.events import router as events_router
 from routes.dlq import router as dlq_router
 from routes.reprocess import router as reprocess_router
 from routes.drain import router as drain_router
+from routes.parsers import ensure_builtin_parsers
+from routes.parsers import router as parsers_router
 
 
 CORS_ORIGINS = [
@@ -50,6 +52,14 @@ async def lifespan(app: FastAPI):
         print(f"Replay publisher unavailable: {exc}", flush=True)
     app.state.replay_publisher = publisher
 
+    # Register the built-in parsers so the registry is populated on a fresh
+    # stack. Only ever inserts: an operator's edit to an existing record
+    # survives the restart.
+    try:
+        ensure_builtin_parsers()
+    except Exception as exc:
+        print(f"Parser registry seeding unavailable: {exc}", flush=True)
+
     try:
         yield
     finally:
@@ -73,6 +83,7 @@ app.include_router(events_router)
 app.include_router(dlq_router)
 app.include_router(reprocess_router)
 app.include_router(drain_router)
+app.include_router(parsers_router)
 
 
 @app.get("/")

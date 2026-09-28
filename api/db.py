@@ -21,6 +21,7 @@ SILVER_INDEX = os.getenv("SILVER_INDEX", "ulpf-silver")
 DLQ_INDEX = os.getenv("DLQ_INDEX", "ulpf-dlq")
 BRONZE_INDEX = os.getenv("BRONZE_INDEX", "ulpf-bronze")
 REPROCESS_RUNS_INDEX = os.getenv("REPROCESS_RUNS_INDEX", "ulpf-reprocess-runs")
+PARSERS_INDEX = os.getenv("PARSERS_INDEX", "ulpf-parsers")
 
 SOURCES_MAPPING = {
     "mappings": {
@@ -130,6 +131,26 @@ REPROCESS_RUNS_MAPPING = {
     }
 }
 
+# The parser registry. Priority and status are mapped because the UI orders
+# the chain by them and filters on status; an unmapped field in a fresh index
+# cannot be sorted or filtered on.
+PARSERS_MAPPING = {
+    "mappings": {
+        "properties": {
+            "parser_id": {"type": "keyword"},
+            "display_name": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+            "status": {"type": "keyword"},
+            "priority": {"type": "long"},
+            "version": {"type": "long"},
+            "is_builtin": {"type": "boolean"},
+            "source_formats": {"type": "keyword"},
+            "created_at": {"type": "date"},
+            "updated_at": {"type": "date"},
+            "last_test": {"type": "object", "enabled": False},
+        }
+    }
+}
+
 INDEX_BODIES = {
     SOURCES_INDEX: SOURCES_MAPPING,
     UPLOADS_INDEX: UPLOADS_MAPPING,
@@ -137,6 +158,7 @@ INDEX_BODIES = {
     SILVER_INDEX: SILVER_MAPPING,
     DLQ_INDEX: DLQ_MAPPING,
     REPROCESS_RUNS_INDEX: REPROCESS_RUNS_MAPPING,
+    PARSERS_INDEX: PARSERS_MAPPING,
 }
 
 
@@ -153,6 +175,7 @@ def ensure_indices(es: OpenSearch = None, indices: list = None):
         SILVER_INDEX,
         DLQ_INDEX,
         REPROCESS_RUNS_INDEX,
+        PARSERS_INDEX,
     ]
     for name in names:
         if es.indices.exists(index=name):

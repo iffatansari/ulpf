@@ -8,6 +8,13 @@ export interface ParserMeta {
   example: string;
 }
 
+/**
+ * These are the only parser ids the orchestrator actually runs. The order and
+ * the existence of each entry are enforced by the backend registry
+ * (orchestrator/parsers/registry.py) and its anti-drift test -- this file is
+ * documentation copy, not the list of what exists. Never add an entry here
+ * without a matching real parser in orchestrator/main.py.
+ */
 export const PARSERS: ParserMeta[] = [
   {
     id: "json",
@@ -24,7 +31,7 @@ export const PARSERS: ParserMeta[] = [
     formats: ["syslog"],
     priority: "2",
     description: "Supports RFC 5424 (<PRI>1 TIMESTAMP HOST APP PID MSGID SD MSG) and legacy RFC 3164 (<PRI>Mmm dd hh:mm:ss host app[pid]: msg).",
-    features: ["RFC 5424 structured data parsed and flattened", "PRI severity mapped to OCSF (0-7 level table)", "APP-NAME→process name, PROCID→app_name fallback"],
+    features: ["RFC 5424 structured data parsed and flattened, quote-aware", "NILVALUE handled, MSGID and PROCID captured", "RFC 3164 timestamps get an explicit year in UTC"],
     example: '<34>1 2024-01-22T12:42:48Z web1 sshd 2321 - - "Failed password for admin"',
   },
   {
@@ -37,39 +44,12 @@ export const PARSERS: ParserMeta[] = [
     example: 'CEF:0|Palo Alto Networks|PA-VM|11.0|TRAFFIC|Allow outbound connection|4|src=10.0.0.41 srcPort=51243 dst=10.0.0.12 dpt=443 act=allow',
   },
   {
-    id: "leef",
-    name: "LEEF",
-    formats: ["leef"],
-    priority: "4",
-    description: "IBM LEEF 2.0: LEEF:Version|Vendor|Product|Version|EventID|Delimiter|Key|Key=Value pairs.",
-    features: ["Custom delimiter support", "Vendor / product / event id preserved", "Key=Value extension parsed like CEF"],
-    example: 'LEEF:1.0|IBM|QRadar|7.5|2002|\\t|src=10.0.0.1 sev=6 devTime=Jan 22 2024 12:43:02',
-  },
-  {
-    id: "keyvalue",
-    name: "Key=Value",
-    formats: ["keyvalue"],
-    priority: "5",
-    description: "Space separated name=value pairs — the lingua franca produced by iptables, cloudtrail-ish and custom middleware.",
-    features: ["Requires >= 3 balanced pairs to avoid prose", "Quoted values may contain spaces", "Alias table maps dpt→dst port, suser→user, act→action …"],
-    example: "user=bob action=login result=failed src=10.0.0.1 dst=192.168.1.1",
-  },
-  {
-    id: "apache",
-    name: "Apache / Nginx",
-    formats: ["apache"],
-    priority: "6",
-    description: "Combined access log format (CLF with referer + user agent). IP, ident and authuser before the timestamp bracket.",
-    features: ["Method, path and status extracted", "Response bytes / referer / user_agent kept", "Screen height parsing for virtual hosts"],
-    example: '192.168.1.5 - - [22/Jan/2024:12:42:48 +0000] "GET /api/users?id=7 HTTP/1.1" 200 532 "http://site.local/" "Mozilla/5.0"',
-  },
-  {
-    id: "text",
-    name: "Plain Text",
+    id: "drain3-fallback-v1",
+    name: "Drain3 fallback",
     formats: ["text"],
-    priority: "7 — last resort",
-    description: "Fallback for human-readable app logs. Only familiar signal phrases (login failed, started, attack, blocked…) are accepted — pure prose is rejected.",
-    features: ["Signal-based heuristic, no fabrication", "Time prefixes parsed when present", "Rejects filler lines with a clear reason"],
+    priority: "4 — last resort",
+    description: "Drain3 clusters log lines by template so variable parts (ids, paths, IPs) become fields. Accepts any line as a template, so it will claim lines the parsers above reject.",
+    features: ["Template-based clustering via the drain3 library", "Unmatched lines still yield a template cluster", "Runs last, so a claimed line is a false negative for the parser that should have taken it"],
     example: "2024-01-22T12:42:48Z api-gateway login for user bob failed: bad password",
   },
 ];
