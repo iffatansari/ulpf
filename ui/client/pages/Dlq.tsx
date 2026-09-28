@@ -42,6 +42,22 @@ function formatWhen(value?: string | null): string {
 }
 
 /**
+ * Rejections that are an honest answer, not a fault in the pipeline.
+ *
+ * `no_recoverable_identity` means every parser was tried, including the drain3
+ * fallback, and the line simply had no field the fallback could label as an
+ * identity. No parser would have saved that line, so presenting it in the same
+ * alarm-red as an index rejection sends an operator hunting for a broken
+ * parser that does not exist. It is still a real rejection and still counted,
+ * just not a defect.
+ */
+const BENIGN_REASONS = new Set(["no_recoverable_identity"]);
+
+function isBenignReason(reason: string): boolean {
+  return BENIGN_REASONS.has(reason);
+}
+
+/**
  * DLQ recovery control room.
  *
  * This page never parses anything. Re-parse is not a browser-side re-run of
@@ -289,7 +305,11 @@ export default function Dlq() {
       {reasons.length > 0 && (
         <div className="mb-5 flex flex-wrap items-center gap-1.5">
           {reasons.map(([reason, count]) => (
-            <Badge key={reason} variant="destructive" className="font-mono text-[11px]">
+            <Badge
+              key={reason}
+              variant={isBenignReason(reason) ? "outline" : "destructive"}
+              className="font-mono text-[11px]"
+            >
               {reason} · {count}
             </Badge>
           ))}
@@ -362,6 +382,9 @@ export default function Dlq() {
             {records.map((r) => {
               const history = r.attempt_history ?? [];
               const isRecovered = r.resolution_status === "recovered";
+              const reason = r.classification ?? r.status;
+              const rejectReason =
+                typeof r.metadata?.reject_reason === "string" ? r.metadata.reject_reason : null;
               return (
                 <div key={r.dlq_id} className="border-b border-border px-3 py-3 last:border-0">
                   <div className="flex items-start gap-3">
@@ -374,8 +397,11 @@ export default function Dlq() {
                     />
                     <div className="min-w-0 flex-1">
                       <div className="mb-1 flex flex-wrap items-center gap-2">
-                        <Badge variant="destructive" className="px-1.5 py-0.5 text-[10px]">
-                          {r.classification ?? r.status}
+                        <Badge
+                          variant={isBenignReason(reason) ? "outline" : "destructive"}
+                          className="px-1.5 py-0.5 text-[10px]"
+                        >
+                          {reason}
                         </Badge>
                         {isRecovered ? (
                           <Badge className="border-transparent bg-[#BDEDE3] px-1.5 py-0.5 text-[10px] font-bold text-[#0f766e]">
@@ -397,6 +423,9 @@ export default function Dlq() {
                         {r.reprocess_count === 1 ? "" : "s"}
                         {r.last_reprocess_id ? ` · run ${r.last_reprocess_id.slice(0, 8)}` : ""}
                       </p>
+                      {rejectReason && (
+                        <p className="mt-1 text-[11px] text-muted-foreground">{rejectReason}</p>
+                      )}
                       {r.replay_reason && (
                         <p className="mt-1 text-[11px] text-muted-foreground">
                           Reason: {r.replay_reason}

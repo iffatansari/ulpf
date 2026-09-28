@@ -342,6 +342,102 @@ def test_drain3_still_declines_lines_with_no_recoverable_identity():
     assert normalized is None
 
 
+# ------------------------------- naming the residual reject for what it is
+
+
+def test_exhausted_chain_is_labelled_no_recoverable_identity():
+    """
+    Once the Drain3 tier has run and declined, "no_parser_match" is a lie: the
+    format was matched-or-exhausted and the fallback was tried. The real reason
+    is that the line carried no field Drain3 could label as an identity, which
+    is a different problem with a different operator response than "we do not
+    know what this format is".
+    """
+    from orchestrator.main import create_dlq_record
+
+    record = create_dlq_record(
+        _raw("json", "total noise with no identity anywhere"),
+        ["json-parser-v1", "drain3-fallback-v1"],
+    )
+
+    assert record.classification == "no_recoverable_identity"
+    assert record.status == "parse_failure"
+    assert record.metadata["reject_reason"], (
+        "the label is only actionable if it says WHY there is nothing to stand "
+        "an event on"
+    )
+
+
+def test_exhausted_chain_label_wins_over_format_unidentified():
+    """
+    hint=unknown with an exhausted chain used to report format_unidentified.
+    Reaching the fallback tier means every parser was already tried, so the
+    decisive fact is the missing identity, not the unknown hint.
+    """
+    from orchestrator.main import create_dlq_record
+
+    record = create_dlq_record(
+        _raw("unknown", "just some words with nothing identifiable inside"),
+        ["cef-parser-v1", "json-parser-v1", "syslog-parser-v1", "drain3-fallback-v1"],
+    )
+
+    assert record.classification == "no_recoverable_identity"
+
+
+def test_exhausted_chain_label_does_not_swallow_an_index_rejection():
+    """
+    index_rejected means the event DID parse and only OpenSearch refused it.
+    That is a different fault entirely and keeps its own status, so the new
+    label must not fire for it.
+    """
+    from orchestrator.main import create_dlq_record
+
+    record = create_dlq_record(
+        _raw("json", '{"level": "notice"}'),
+        ["json-parser-v1", "drain3-fallback-v1"],
+        classification="index_rejected",
+        status="index_failure",
+    )
+
+    assert record.classification == "index_rejected"
+    assert record.status == "index_failure"
+
+
+def test_labels_without_the_fallback_tier_are_unchanged():
+    """
+    The new label describes the fallback's own decline. A record that never
+    reached that tier keeps the classification it always had, so existing
+    history and the dry-run reasoning stay comparable.
+    """
+    from orchestrator.main import create_dlq_record
+
+    hinted = create_dlq_record(_raw("json", '{"a":'), ["json-parser-v1"])
+    assert hinted.classification == "no_parser_match"
+
+    unknown = create_dlq_record(_raw("unknown", "free text"), ["a"])
+    assert unknown.classification == "format_unidentified"
+
+
+def test_the_real_truncated_json_dlq_record_is_labelled_for_its_actual_cause():
+    """
+    This is the exact payload sitting in the live DLQ. It carries a user and a
+    host in plain text but the JSON is cut mid-value, so Drain3's miner sees a
+    fixed template with no variables to label. The record has to name that
+    cause, because "no_parser_match" sends an operator hunting for a parser
+    bug when nothing about the parser is broken.
+    """
+    from orchestrator.main import create_dlq_record, normalize_raw_event
+
+    event = _raw("json", '{"host": "win-web-03", "user": "erin", "level": ')
+    normalized, attempted = normalize_raw_event(event)
+
+    assert normalized is None, "premise: this payload cannot be normalized"
+    assert attempted == ["json-parser-v1", "drain3-fallback-v1"]
+
+    record = create_dlq_record(event, attempted)
+    assert record.classification == "no_recoverable_identity"
+
+
 # ----------------------------------------------- dry-run honesty about drain3
 
 

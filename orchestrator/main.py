@@ -14,7 +14,7 @@ from schema.dlq_record import DLQRecord
 from parsers.cef_parser import parse_cef_log
 from parsers.json_parser import parse_json_log
 from parsers.syslog_parser import parse_syslog
-from parsers.drain_fallback import parse_drain
+from parsers.drain_fallback import PARSER_ID as DRAIN3_PARSER_ID, parse_drain
 
 from dlq.reprocess import (
     HEADER_REPROCESS_ID,
@@ -347,9 +347,28 @@ def create_dlq_record(
     status: Optional[str] = None,
 ) -> DLQRecord:
 
+    reject_reason: Optional[str] = None
+
     # A record that normalized but could not be indexed.
     if classification is not None:
         pass
+
+    # The whole chain ran, including the fallback tier, and the fallback still
+    # declined. That is not "no parser matched" and not "unknown format" --
+    # every parser had its turn. The cause is that Drain3 found no field it
+    # could label as an identity, so there is nothing to stand an event on.
+    # Labelling it distinctly is the difference between an operator reading
+    # "the format is unknown, let me add a parser" and "this line is
+    # contentless, and no parser would have saved it".
+    elif DRAIN3_PARSER_ID in parsers_attempted:
+
+        classification = "no_recoverable_identity"
+        status = "parse_failure"
+        reject_reason = (
+            "every parser was tried including the drain3 fallback, which "
+            "declined: no src/dst/user/mac field in the line could be labeled "
+            "as an identity to stand an event on"
+        )
 
     # Unknown format where every known parser failed.
     elif raw_event.format_hint == "unknown":
@@ -381,6 +400,7 @@ def create_dlq_record(
             "source_type": raw_event.source_type,
             "transport": raw_event.transport,
             "format_hint": raw_event.format_hint,
+            **({"reject_reason": reject_reason} if reject_reason else {}),
         },
     )
 

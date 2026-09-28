@@ -113,7 +113,12 @@ def test_unknown_event_goes_to_dlq_when_drain3_fails(monkeypatch):
 		"syslog-parser-v1",
 		"drain3-fallback-v1",
 	]
-	assert main_module.create_dlq_record(raw_event, parsers_attempted).classification == "format_unidentified"
+	# format_hint is still "unknown" here, but the record must not be labelled
+	# format_unidentified: all four parsers including the fallback tier ran and
+	# declined. The decisive cause is the fallback finding no identity to stand
+	# an event on, and saying "unknown format" would send an operator looking for
+	# a missing parser instead of a contentless line.
+	assert main_module.create_dlq_record(raw_event, parsers_attempted).classification == "no_recoverable_identity"
 
 
 def test_real_drain3_preserves_port_when_port_value_changes():
