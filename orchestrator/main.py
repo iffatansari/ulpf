@@ -37,6 +37,19 @@ OPENSEARCH_URL = os.getenv("OPENSEARCH_URL", "http://opensearch:9200")
 # a real chance of being normalized instead of dead-ending in the DLQ.
 _HINTS_WITH_DEDICATED_PARSER = frozenset({"cef", "json", "syslog"})
 
+# One table rather than three near-identical branches. The declared parser is
+# tried first, and only if it declines does the Drain3 tier get a turn -- a
+# hint is a preference, not a commitment that ends in the DLQ.
+_DEDICATED_PARSERS = {
+    "cef": ("cef-parser-v1", parse_cef_log),
+    "json": ("json-parser-v1", parse_json_log),
+    "syslog": ("syslog-parser-v1", parse_syslog),
+}
+
+# The order an unhinted line is probed in, before the Drain3 fallback.
+_PROBE_CHAIN = tuple(_DEDICATED_PARSERS.values())
+
+
 SILVER_INDEX = os.getenv("SILVER_INDEX", "ulpf-silver")
 DLQ_INDEX = os.getenv("DLQ_INDEX", "ulpf-dlq")
 BRONZE_INDEX = os.getenv("BRONZE_INDEX", "ulpf-bronze")
@@ -204,14 +217,54 @@ def try_parser(
         return None, parser_id
 
 
+def _try_drain_fallback(
+    raw_event: RawEventEnvelope,
+    parsers_attempted: list[str],
+) -> Optional[NormalizedEvent]:
+    """
+    Give the Drain3 tier its turn and report whether it answered.
+
+    Split out because every failure path needs it: the fallback is what stands
+    between a rejected line and the DLQ.
+    """
+    normalized, attempted_parser_id = try_parser(
+        parse_drain,
+        "drain3-fallback-v1",
+        raw_event,
+    )
+
+    parsers_attempted.append(attempted_parser_id)
+
+    if normalized is not None:
+        print(
+            f"Recovered via {attempted_parser_id} for event "
+            f"{raw_event.event_id}",
+            flush=True,
+        )
+
+    return normalized
+
+
 def normalize_raw_event(
     raw_event: RawEventEnvelope,
 ) -> tuple[Optional[NormalizedEvent], list[str]]:
     """
     Decide which parser(s) should be tried.
 
+    A format hint is a PREFERENCE, not a commitment. When the hinted parser
+    parses the line, it wins and the fallback is never touched. When it
+    declines, the Drain3 tier still gets a turn before anything is rejected,
+    because a hint that no longer matches the traffic (a source reconfigured,
+    a vendor changing its format, a truncated write) used to dead-end
+    straight into the DLQ even though the fallback existed precisely to catch
+    "no dedicated parser matched".
+
+    That distinction matters: every event minted as a DLQ record is work an
+    operator has to triage and replay, so the chain should only reject once
+    the fallback has also had its turn.
+
     Known format:
-        Use the corresponding parser.
+        Use the corresponding parser, then Drain3 if it declines.
 
     Unknown format:
         Probe all known parsers until one successfully
@@ -222,58 +275,30 @@ def normalize_raw_event(
     parsers_attempted = []
 
     # ---------------------------------------------------------
-    # 1. CEF explicitly identified
+    # 1-3. A hint that has a parser of its own
+    #
+    # One table instead of three near-identical branches: the behaviour
+    # has to be identical for cef/json/syslog, and duplicating it three
+    # times is how only some of them got the fall-through.
     # ---------------------------------------------------------
-    if raw_event.format_hint == "cef":
+    dedicated = _DEDICATED_PARSERS.get(raw_event.format_hint)
 
-        normalized, parser_id = try_parser(
-            parse_cef_log,
-            "cef-parser-v1",
+    if dedicated is not None:
+        parser_id, parser = dedicated
+
+        normalized, attempted_parser_id = try_parser(
+            parser,
+            parser_id,
             raw_event,
         )
 
-        parsers_attempted.append(parser_id)
+        parsers_attempted.append(attempted_parser_id)
 
         if normalized is not None:
             return normalized, parsers_attempted
 
-        return None, parsers_attempted
-
-    # ---------------------------------------------------------
-    # 2. JSON explicitly identified
-    # ---------------------------------------------------------
-    if raw_event.format_hint == "json":
-
-        normalized, parser_id = try_parser(
-            parse_json_log,
-            "json-parser-v1",
-            raw_event,
-        )
-
-        parsers_attempted.append(parser_id)
-
-        if normalized is not None:
-            return normalized, parsers_attempted
-
-        return None, parsers_attempted
-
-    # ---------------------------------------------------------
-    # 3. Syslog explicitly identified
-    # ---------------------------------------------------------
-    if raw_event.format_hint == "syslog":
-
-        normalized, parser_id = try_parser(
-            parse_syslog,
-            "syslog-parser-v1",
-            raw_event,
-        )
-
-        parsers_attempted.append(parser_id)
-
-        if normalized is not None:
-            return normalized, parsers_attempted
-
-        return None, parsers_attempted
+        # Declined. Fall through rather than reject.
+        return _try_drain_fallback(raw_event, parsers_attempted), parsers_attempted
 
     # ---------------------------------------------------------
     # 4. NO DEDICATED PARSER FOR THIS HINT
@@ -290,38 +315,12 @@ def normalize_raw_event(
     # giving Drain3 a chance. A mislabelled or vendor-specific hint
     # should still get the full probe rather than being dead-ended.
     # ---------------------------------------------------------
-    if raw_event.format_hint not in _HINTS_WITH_DEDICATED_PARSER:
 
-        candidate_parsers = [
-            ("cef-parser-v1", parse_cef_log),
-            ("json-parser-v1", parse_json_log),
-            ("syslog-parser-v1", parse_syslog),
-        ]
-
-        for parser_id, parser in candidate_parsers:
-
-            normalized, attempted_parser_id = try_parser(
-                parser,
-                parser_id,
-                raw_event,
-            )
-
-            parsers_attempted.append(attempted_parser_id)
-
-            if normalized is not None:
-
-                print(
-                    f"Unknown format identified as "
-                    f"{parser_id} for event "
-                    f"{raw_event.event_id}",
-                    flush=True,
-                )
-
-                return normalized, parsers_attempted
+    for parser_id, parser in _PROBE_CHAIN:
 
         normalized, attempted_parser_id = try_parser(
-            parse_drain,
-            "drain3-fallback-v1",
+            parser,
+            parser_id,
             raw_event,
         )
 
@@ -331,21 +330,14 @@ def normalize_raw_event(
 
             print(
                 f"Unknown format identified as "
-                f"{attempted_parser_id} for event "
+                f"{parser_id} for event "
                 f"{raw_event.event_id}",
                 flush=True,
             )
 
             return normalized, parsers_attempted
 
-        return None, parsers_attempted
-
-    # ---------------------------------------------------------
-    # 5. Unreachable: every hint either has a dedicated parser
-    #    (returned above) or takes the full-probe + Drain3 path.
-    # ---------------------------------------------------------
-
-    return None, parsers_attempted
+    return _try_drain_fallback(raw_event, parsers_attempted), parsers_attempted
 
 
 def create_dlq_record(

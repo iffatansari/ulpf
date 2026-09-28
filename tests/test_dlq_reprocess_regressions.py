@@ -221,7 +221,7 @@ def test_every_unrecognised_hint_still_reaches_the_drain3_tier(hint):
 
 
 def test_dedicated_hint_still_commits_to_its_own_parser_only():
-    """The fix must not weaken hint authority for cef/json/syslog."""
+    """A hint that PARSES must not also drag in the fallback tier."""
     from orchestrator.main import normalize_raw_event
     from schema.raw_event import RawEventEnvelope
 
@@ -242,6 +242,77 @@ def test_dedicated_hint_still_commits_to_its_own_parser_only():
     assert attempted == ["cef-parser-v1"]
     assert "drain3-fallback-v1" not in attempted
     assert normalized.parser_id == "cef-parser-v1"
+
+
+# A line the dedicated parser for its declared hint will refuse, but which
+# Drain3 can still stand an event up on.
+_MISLABELLED_BUT_RECOVERABLE = (
+    "Sep 16 12:00:00 fw-1 action=blocked src=10.0.0.5 dst=8.8.8.8 port=443"
+)
+
+
+def _raw(hint: str, payload: str):
+    from schema.raw_event import RawEventEnvelope
+
+    return RawEventEnvelope(
+        event_id="raw-mislabel",
+        ingested_at="2026-09-27T10:00:00+00:00",
+        source_id="fw-1",
+        source_type="network_device",
+        transport="file",
+        format_hint=hint,
+        raw_payload=payload,
+        collector_id="c1",
+        envelope_schema_version="1.0.0",
+    )
+
+
+@pytest.mark.parametrize("hint", ["cef", "json", "syslog"])
+def test_dedicated_hint_falls_through_to_drain3_when_its_own_parser_declines(hint):
+    """
+    A declared hint is a PREFERENCE, not a commitment that dead-ends in the DLQ.
+
+    When the source says "json" but the line is not JSON, the only thing that
+    happens today is `json-parser-v1` is tried, fails, and the event goes
+    straight to the DLQ. Drain3 -- the tier that exists precisely for "no
+    dedicated parser matched" -- is never given the chance, so a mislabelled
+    or drifted line is dropped into the DLQ even though the fallback could
+    have produced an event from it.
+
+    Every DLQ record the pipeline mints for this reason is work an operator has
+    to triage and replay, when the fallback tier could have handled it inline.
+    """
+    from orchestrator.main import normalize_raw_event
+
+    normalized, attempted = normalize_raw_event(_raw(hint, _MISLABELLED_BUT_RECOVERABLE))
+
+    assert attempted == [
+        {"cef": "cef-parser-v1", "json": "json-parser-v1", "syslog": "syslog-parser-v1"}[hint],
+        "drain3-fallback-v1",
+    ], f"hint={hint!r} did not fall through to drain3 (attempted={attempted})"
+    assert normalized is not None, (
+        f"hint={hint!r} went to the DLQ even though drain3 could parse the line"
+    )
+    assert normalized.parser_id == "drain3-fallback-v1"
+    assert normalized.parser_tier == "drain3"
+    # Still never high confidence, whatever tier answered.
+    assert normalized.confidence_score == 0.5
+    assert normalized.src_endpoint == "10.0.0.5"
+
+
+def test_dedicated_hint_records_that_its_own_parser_ran_first():
+    """
+    The fall-through must stay auditable: a DLQ record built from a hinted
+    event has to show that the declared parser was tried before the fallback,
+    or "why did this not parse as JSON" is unanswerable after the fact.
+    """
+    from orchestrator.dlq.reprocess import HEADER_REPROCESS_ID  # noqa: F401
+    from orchestrator.main import create_dlq_record
+
+    record = create_dlq_record(_raw("json", "total noise, no identity at all"), ["json-parser-v1"])
+
+    assert record.parsers_attempted == ["json-parser-v1"]
+    assert record.classification == "no_parser_match"
 
 
 def test_drain3_still_declines_lines_with_no_recoverable_identity():
