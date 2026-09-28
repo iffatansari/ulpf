@@ -11,26 +11,58 @@ from db import (
     ensure_indices,
     get_opensearch_client,
 )
+from live_events import LiveEventHub, NormalizedEventService
+from replay_bus import ReplayPublisher
 from routes.sources import router as sources_router
 from routes.uploads import enrich_upload_counts, router as uploads_router
 from routes.events import router as events_router
 from routes.dlq import router as dlq_router
+from routes.reprocess import router as reprocess_router
 from routes.drain import router as drain_router
+
+
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", "http://localhost:8080,http://localhost:3000").split(",")
+    if origin.strip()
+]
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Ensure Module 2 indices exist before the API starts serving.
     ensure_indices()
-    yield
+    hub = LiveEventHub()
+    service = NormalizedEventService(hub)
+    app.state.live_event_hub = hub
+    app.state.live_event_service = service
+    await service.start()
+
+    # Module 3: the API republishes Bronze events for replay, so it needs a
+    # Kafka producer of its own. Started with the app and reused for the
+    # lifetime of the process.
+    publisher = ReplayPublisher()
+    try:
+        await publisher.start()
+    except Exception as exc:
+        # A replay is a recovery tool, not a prerequisite for serving the UI.
+        # Failing to start it must not take down sources, events and the DLQ
+        # read paths -- the endpoints that need it already return 503.
+        print(f"Replay publisher unavailable: {exc}", flush=True)
+    app.state.replay_publisher = publisher
+
+    try:
+        yield
+    finally:
+        await publisher.stop()
+        await service.stop()
 
 
 app = FastAPI(title="ULPF API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For MVP; restrict in production
-    allow_credentials=True,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -39,6 +71,7 @@ app.include_router(sources_router)
 app.include_router(uploads_router)
 app.include_router(events_router)
 app.include_router(dlq_router)
+app.include_router(reprocess_router)
 app.include_router(drain_router)
 
 

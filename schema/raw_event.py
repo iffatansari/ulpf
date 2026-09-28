@@ -30,6 +30,7 @@ class RawEventEnvelope(BaseModel):
         "udp",
         "http",
         "file",
+        "sse",
         "other",
     ] = Field(...)
 
@@ -43,6 +44,8 @@ class RawEventEnvelope(BaseModel):
     )
 
     raw_payload: str = Field(...)
+
+    transport_metadata: dict[str, str] = Field(default_factory=dict)
 
     bronze_uri: Optional[str] = Field(None)
 

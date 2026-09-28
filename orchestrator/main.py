@@ -16,6 +16,12 @@ from parsers.json_parser import parse_json_log
 from parsers.syslog_parser import parse_syslog
 from parsers.drain_fallback import parse_drain
 
+from dlq.reprocess import (
+    HEADER_REPROCESS_ID,
+    HEADER_REPROCESS_OF,
+    apply_attempt_outcome,
+)
+
 
 REDPANDA_BROKER = os.getenv("REDPANDA_BROKER", "redpanda:29092")
 
@@ -24,6 +30,12 @@ NORMALIZED_TOPIC = os.getenv("NORMALIZED_TOPIC", "logs.normalized")
 DLQ_TOPIC = os.getenv("DLQ_TOPIC", "logs.dlq")
 
 OPENSEARCH_URL = os.getenv("OPENSEARCH_URL", "http://opensearch:9200")
+
+# Format hints that have a parser of their own. Anything else -- including
+# "unknown", "auto", "raw", "text", "leef", "" and None -- gets the full
+# probe plus the Drain3 fallback tier, so a hint nobody recognises still has
+# a real chance of being normalized instead of dead-ending in the DLQ.
+_HINTS_WITH_DEDICATED_PARSER = frozenset({"cef", "json", "syslog"})
 
 SILVER_INDEX = os.getenv("SILVER_INDEX", "ulpf-silver")
 DLQ_INDEX = os.getenv("DLQ_INDEX", "ulpf-dlq")
@@ -64,11 +76,27 @@ BRONZE_MAPPING = {
 # OpenSearch rejects a sort on them with a 400. Declaring the date
 # types up-front (before any document exists) fixes the fresh-start
 # crash while leaving the rest of the document dynamically mapped.
+#
+# `extensions.original_json` is a lossless passthrough of the source
+# document, so the same key legitimately arrives as a number in one
+# event and a string in the next. Dynamic mapping resolves a field's
+# type from the FIRST document it sees and then rejects every later
+# document that disagrees -- which used to fail the whole Silver
+# write and lose the event. Forcing that subtree to `keyword` makes
+# both shapes indexable; the promoted fields above it stay typed.
+BLOB_AS_KEYWORD = {
+    "path_match": "extensions.original_json.*",
+    "mapping": {"type": "keyword", "ignore_above": 2048},
+}
+
 SILVER_MAPPING = {
     "mappings": {
+        "dynamic_templates": [
+            {"original_json_as_keyword": BLOB_AS_KEYWORD},
+        ],
         "properties": {
             "time": {"type": "date"},
-        }
+        },
     }
 }
 
@@ -108,6 +136,34 @@ def extract_upload_id(headers) -> Optional[str]:
                 return value.decode("utf-8")
             return str(value)
     return None
+
+
+def extract_replay_headers(headers) -> tuple[Optional[str], Optional[str]]:
+    """
+    Read the Module 3 replay headers set by the reprocess service.
+
+    Returns (reprocess_id, dlq_id). Both are None for ordinary ingested
+    traffic, which is what keeps this a transparent change: without these
+    headers the pipeline behaves exactly as it did in Module 2.
+
+    The headers are what let a replay update the EXISTING DLQ record
+    instead of appending a new one. Without them the failure path cannot
+    tell a first-time failure (mint a new record) from a replay that failed
+    again (update the record it came from), and the DLQ would fill up with
+    duplicates of the same event.
+    """
+    reprocess_id = None
+    dlq_id = None
+    for key, value in (headers or []):
+        if value is None:
+            continue
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        if key == HEADER_REPROCESS_ID:
+            reprocess_id = str(value)
+        elif key == HEADER_REPROCESS_OF:
+            dlq_id = str(value)
+    return reprocess_id, dlq_id
 
 
 def try_parser(
@@ -159,7 +215,8 @@ def normalize_raw_event(
 
     Unknown format:
         Probe all known parsers until one successfully
-        produces a valid NormalizedEvent.
+        produces a valid NormalizedEvent, then try the
+        Drain3 fallback tier.
     """
 
     parsers_attempted = []
@@ -219,13 +276,21 @@ def normalize_raw_event(
         return None, parsers_attempted
 
     # ---------------------------------------------------------
-    # 4. UNKNOWN FORMAT
+    # 4. NO DEDICATED PARSER FOR THIS HINT
     #
     # Do NOT use transport to decide the parser.
     #
-    # Probe all known parsers.
+    # Probe all known parsers, then fall through to the Drain3
+    # fallback tier.
+    #
+    # This deliberately covers every hint that is not cef/json/
+    # syslog -- "unknown", but also "auto", "raw", "text", "leef",
+    # "" and None. Those hints have no parser of their own, and
+    # previously fell straight through to the DLQ without ever
+    # giving Drain3 a chance. A mislabelled or vendor-specific hint
+    # should still get the full probe rather than being dead-ended.
     # ---------------------------------------------------------
-    if raw_event.format_hint == "unknown":
+    if raw_event.format_hint not in _HINTS_WITH_DEDICATED_PARSER:
 
         candidate_parsers = [
             ("cef-parser-v1", parse_cef_log),
@@ -276,7 +341,8 @@ def normalize_raw_event(
         return None, parsers_attempted
 
     # ---------------------------------------------------------
-    # 5. No usable format hint
+    # 5. Unreachable: every hint either has a dedicated parser
+    #    (returned above) or takes the full-probe + Drain3 path.
     # ---------------------------------------------------------
 
     return None, parsers_attempted
@@ -285,10 +351,16 @@ def normalize_raw_event(
 def create_dlq_record(
     raw_event: RawEventEnvelope,
     parsers_attempted: list[str],
+    classification: Optional[str] = None,
+    status: Optional[str] = None,
 ) -> DLQRecord:
 
+    # A record that normalized but could not be indexed.
+    if classification is not None:
+        pass
+
     # Unknown format where every known parser failed.
-    if raw_event.format_hint == "unknown":
+    elif raw_event.format_hint == "unknown":
 
         classification = "format_unidentified"
         status = "unknown"
@@ -319,6 +391,55 @@ def create_dlq_record(
             "format_hint": raw_event.format_hint,
         },
     )
+
+
+async def route_index_rejection(
+    producer: AIOKafkaProducer,
+    opensearch: OpenSearch,
+    raw_event: RawEventEnvelope,
+    normalized: Optional[NormalizedEvent],
+    stage: str,
+    error: Exception,
+) -> None:
+    """
+    A record that parsed cleanly but could not be indexed still has to be
+    visible. Persist it in the DLQ with `index_rejected` so the loss shows up
+    in the UI with the reason attached, instead of vanishing in a log line.
+    """
+    record = create_dlq_record(
+        raw_event,
+        [normalized.parser_id] if normalized is not None else [],
+        classification="index_rejected",
+        status="index_failure",
+    )
+    document = record.model_dump(mode="json")
+    document["metadata"] = {
+        **(document.get("metadata") or {}),
+        "rejected_stage": stage,
+        "rejected_parser": normalized.parser_id if normalized else None,
+        "index_error": f"{type(error).__name__}: {error}"[:2000],
+    }
+    try:
+        opensearch.index(
+            index=DLQ_INDEX,
+            id=record.dlq_id,
+            body=document,
+        )
+    except Exception as dlq_exc:
+        print(
+            f"DLQ write also failed for {raw_event.event_id}: {dlq_exc}",
+            flush=True,
+        )
+    try:
+        await producer.send_and_wait(
+            DLQ_TOPIC,
+            json.dumps(document).encode("utf-8"),
+        )
+    except Exception as kafka_exc:
+        print(
+            f"DLQ publish failed for {raw_event.event_id}: {kafka_exc}",
+            flush=True,
+        )
 
 
 async def main():
@@ -388,6 +509,13 @@ async def main():
                 if upload_id:
                     raw_document["upload_id"] = upload_id
 
+                # Module 3: a replayed event carries the reprocess headers.
+                # Absent for normal traffic.
+                reprocess_id, replay_dlq_id = extract_replay_headers(
+                    msg.headers
+                )
+                is_replay = reprocess_id is not None and replay_dlq_id is not None
+
                 opensearch.index(
                     index=BRONZE_INDEX,
                     id=raw_event.event_id,
@@ -408,17 +536,37 @@ async def main():
                         mode="json"
                     )
 
+                    try:
+                        opensearch.index(
+                            index=SILVER_INDEX,
+                            id=normalized.event_id,
+                            body=normalized_document,
+                        )
+                    except Exception as index_exc:
+                        # The parser succeeded but OpenSearch refused the
+                        # document (mapping conflict, strict mapping, ...).
+                        # Losing it here would hide it from every count, so
+                        # it goes to the DLQ with its own classification.
+                        print(
+                            f"Silver write rejected for "
+                            f"{raw_event.event_id}: {index_exc}",
+                            flush=True,
+                        )
+                        await route_index_rejection(
+                            producer=producer,
+                            opensearch=opensearch,
+                            raw_event=raw_event,
+                            normalized=normalized,
+                            stage="silver",
+                            error=index_exc,
+                        )
+                        continue
+
                     await producer.send_and_wait(
                         NORMALIZED_TOPIC,
                         json.dumps(
                             normalized_document
                         ).encode("utf-8"),
-                    )
-
-                    opensearch.index(
-                        index=SILVER_INDEX,
-                        id=normalized.event_id,
-                        body=normalized_document,
                     )
 
                     print(
@@ -428,11 +576,62 @@ async def main():
                         flush=True,
                     )
 
+                    # Module 3: a replay that reaches Silver RECOVERS the
+                    # original DLQ record. The record is kept, not deleted,
+                    # so "was this originally a failure?" stays answerable.
+                    if is_replay:
+                        apply_attempt_outcome(
+                            es=opensearch,
+                            dlq_id=replay_dlq_id,
+                            reprocess_id=reprocess_id,
+                            result="recovered",
+                            reason=f"replayed via {normalized.parser_id}",
+                        )
+                        print(
+                            f"Reprocess {reprocess_id}: DLQ "
+                            f"{replay_dlq_id} -> recovered",
+                            flush=True,
+                        )
+
                     continue
 
                 # -------------------------------------------------
                 # FAILURE → DLQ
                 # -------------------------------------------------
+
+                # Module 3: a replay that fails AGAIN must update the
+                # record it came from, never mint a second one. Creating a
+                # fresh DLQRecord here would give one unparseable event N
+                # documents after N replays, inflating the DLQ count and
+                # destroying the audit trail.
+                if is_replay:
+                    apply_attempt_outcome(
+                        es=opensearch,
+                        dlq_id=replay_dlq_id,
+                        reprocess_id=reprocess_id,
+                        result="failed",
+                        reason="no parser produced a valid normalized event",
+                    )
+                    await producer.send_and_wait(
+                        DLQ_TOPIC,
+                        json.dumps(
+                            {
+                                "dlq_id": replay_dlq_id,
+                                "raw_event_id": raw_event.event_id,
+                                "reprocess_id": reprocess_id,
+                                "reprocessed": True,
+                                "resolution_status": "unresolved",
+                                "parsers_attempted": parsers_attempted,
+                            }
+                        ).encode("utf-8"),
+                    )
+                    print(
+                        f"Reprocess {reprocess_id}: DLQ "
+                        f"{replay_dlq_id} still unresolved | "
+                        f"parsers_attempted={parsers_attempted}",
+                        flush=True,
+                    )
+                    continue
 
                 dlq_record = create_dlq_record(
                     raw_event,

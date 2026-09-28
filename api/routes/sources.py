@@ -31,7 +31,7 @@ class SourceCreate(BaseModel):
         "iot",
         "custom",
     ] = Field(...)
-    transport: Literal["udp", "http", "file", "other"] = Field(...)
+    transport: Literal["udp", "http", "file", "sse", "other", "kafka_sim"] = Field(...)
     expected_format: Literal["auto", "mixed", "syslog", "json", "cef"] = Field(
         default="mixed"
     )
@@ -96,7 +96,7 @@ def list_sources():
 def create_source(source: SourceCreate):
     """
     Register one log source in the Source Registry (ulpf-sources).
-    Transport is one of: udp, http, file, other.
+    Transport is one of: udp, http, file, sse, other.
     """
     source_id = make_source_id(source.name)
     document = to_source_doc(source_id, source.model_dump())

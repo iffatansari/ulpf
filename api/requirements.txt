@@ -5,3 +5,4 @@ pydantic
 httpx
 python-multipart
 drain3
+aiokafka

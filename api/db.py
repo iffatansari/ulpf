@@ -20,6 +20,7 @@ UPLOADS_INDEX = os.getenv("UPLOADS_INDEX", "ulpf-uploads")
 SILVER_INDEX = os.getenv("SILVER_INDEX", "ulpf-silver")
 DLQ_INDEX = os.getenv("DLQ_INDEX", "ulpf-dlq")
 BRONZE_INDEX = os.getenv("BRONZE_INDEX", "ulpf-bronze")
+REPROCESS_RUNS_INDEX = os.getenv("REPROCESS_RUNS_INDEX", "ulpf-reprocess-runs")
 
 SOURCES_MAPPING = {
     "mappings": {
@@ -102,6 +103,29 @@ DLQ_MAPPING = {
         "properties": {
             "first_seen_at": {"type": "date"},
             "last_attempt_at": {"type": "date"},
+            # Module 3 recovery audit. DLQ documents written before Module 3
+            # have no such fields; declaring them here keeps the index mapping
+            # stable and makes the new axes queryable/sortable.
+            "resolved_at": {"type": "date"},
+            "resolution_status": {"type": "keyword"},
+            "last_reprocess_id": {"type": "keyword"},
+            "reprocess_count": {"type": "long"},
+        }
+    }
+}
+
+REPROCESS_RUNS_MAPPING = {
+    "mappings": {
+        "properties": {
+            "reprocess_id": {"type": "keyword"},
+            "created_at": {"type": "date"},
+            "started_at": {"type": "date"},
+            "completed_at": {"type": "date"},
+            "status": {"type": "keyword"},
+            "requested_count": {"type": "long"},
+            "published_count": {"type": "long"},
+            "recovered_count": {"type": "long"},
+            "failed_count": {"type": "long"},
         }
     }
 }
@@ -112,6 +136,7 @@ INDEX_BODIES = {
     BRONZE_INDEX: BRONZE_MAPPING,
     SILVER_INDEX: SILVER_MAPPING,
     DLQ_INDEX: DLQ_MAPPING,
+    REPROCESS_RUNS_INDEX: REPROCESS_RUNS_MAPPING,
 }
 
 
@@ -127,6 +152,7 @@ def ensure_indices(es: OpenSearch = None, indices: list = None):
         BRONZE_INDEX,
         SILVER_INDEX,
         DLQ_INDEX,
+        REPROCESS_RUNS_INDEX,
     ]
     for name in names:
         if es.indices.exists(index=name):
@@ -158,3 +184,64 @@ def get_bronze(event_id: str):
         return None
     doc = es.get(index=BRONZE_INDEX, id=event_id)
     return doc["_source"]
+
+
+# DLQ documents written before Module 3 predate these fields. Fill them in on
+# read so every consumer (API response, UI) sees one consistent shape instead
+# of branching on whether the key happens to be present.
+DLQ_AUDIT_DEFAULTS = {
+    "resolution_status": "unresolved",
+    "resolved_at": None,
+    "last_reprocess_id": None,
+    "replay_reason": None,
+    "attempt_history": [],
+    "reprocess_count": 0,
+}
+
+
+def with_audit_defaults(record: dict) -> dict:
+    """
+    Return a DLQ record with the Module 3 recovery fields defaulted.
+
+    Missing keys mean "written before Module 3", which is exactly an
+    unresolved record that has never been replayed.
+    """
+    merged = dict(record or {})
+    for key, default in DLQ_AUDIT_DEFAULTS.items():
+        merged.setdefault(key, default)
+    return merged
+
+
+def get_dlq(dlq_id: str):
+    """
+    Fetch one DLQ record by id. Returns the document dict or None.
+    """
+    es = get_opensearch_client()
+    if not es.exists(index=DLQ_INDEX, id=dlq_id):
+        return None
+    doc = es.get(index=DLQ_INDEX, id=dlq_id)
+    return with_audit_defaults(doc["_source"])
+
+
+def get_silver(event_id: str):
+    """
+    Fetch one Silver document by its _id (which is `<raw_event_id>-norm`).
+    Returns the document dict or None.
+    """
+    es = get_opensearch_client()
+    if not es.exists(index=SILVER_INDEX, id=event_id):
+        return None
+    doc = es.get(index=SILVER_INDEX, id=event_id)
+    return doc["_source"]
+
+
+def silver_exists_for_raw(raw_event_id: str) -> bool:
+    """
+    True when a normalized event exists in Silver for this raw event.
+
+    Parsers derive the normalized event_id as `<raw_event_id>-norm`, so the
+    normalized document has a deterministic id and a replay overwrites the
+    same row instead of appending a duplicate.
+    """
+    es = get_opensearch_client()
+    return bool(es.exists(index=SILVER_INDEX, id=f"{raw_event_id}-norm"))

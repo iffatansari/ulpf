@@ -3,6 +3,12 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
 from schema.normalized_event import NormalizedEvent
+from parsers.severity import (
+    severity_from_message,
+    syslog_facility_name,
+    syslog_severity_from_pri,
+    syslog_severity_name,
+)
 
 
 # Very simple BSD syslog parser for MVP (RFC 3164-like)
@@ -10,7 +16,7 @@ SYSLOG_PATTERN = re.compile(
     r"^(?:<(?P<pri>\d{1,3})>)?"
     r"(?P<timestamp>\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+"
     r"(?P<host>\S+)\s+"
-    r"(?P<program>[^:]+):\s+"
+    r"(?P<program>[^\[\]:]+?)(?:\[(?P<pid>\d+)\])?:\s+"
     r"(?P<message>.*)$"
 )
 
@@ -29,6 +35,8 @@ def parse_syslog(raw_payload: str, raw_event_id: str, source_id: str) -> Optiona
     host = groups["host"]
     program = groups["program"]
     message = groups["message"]
+    pri_raw = groups["pri"]
+    pid_raw = groups["pid"]
 
     # Infer year from current year (MVP simplification)
     now = datetime.now(timezone.utc)
@@ -40,13 +48,26 @@ def parse_syslog(raw_payload: str, raw_event_id: str, source_id: str) -> Optiona
         # If parsing fails, let fallback handle it
         return None
 
-    # Very naive severity inference from message content
-    severity = "low"
-    msg_lower = message.lower()
-    if "error" in msg_lower or "fail" in msg_lower:
-        severity = "high"
-    elif "warn" in msg_lower:
-        severity = "medium"
+    # An explicit <PRI> is the sender's own classification, so it wins.
+    # Keyword inference is only the fallback for lines without a <PRI>.
+    severity = syslog_severity_from_pri(pri_raw)
+    if severity is None:
+        severity = severity_from_message(message) or "low"
+
+    extensions: Dict[str, Any] = {
+        "source_id": source_id,
+        "syslog_message": message,
+    }
+    if pri_raw is not None:
+        extensions["syslog_pri"] = int(pri_raw)
+        facility = syslog_facility_name(pri_raw)
+        if facility is not None:
+            extensions["syslog_facility"] = facility
+        severity_name = syslog_severity_name(pri_raw)
+        if severity_name is not None:
+            extensions["syslog_severity_code"] = severity_name
+    if pid_raw is not None:
+        extensions["syslog_pid"] = int(pid_raw)
 
     return NormalizedEvent(
         event_id=f"{raw_event_id}-norm",
@@ -68,8 +89,5 @@ def parse_syslog(raw_payload: str, raw_event_id: str, source_id: str) -> Optiona
         dst_endpoint=None,
         protocol_name=None,
         action=None,
-        extensions={
-            "source_id": source_id,
-            "syslog_message": message,
-        },
+        extensions=extensions,
     )

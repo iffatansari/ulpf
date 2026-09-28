@@ -99,7 +99,7 @@ def parse_drain(raw_payload: str, raw_event_id: str, source_id: str) -> Normaliz
         severity="low",
         time=_best_effort_timestamp(raw_payload),
         user=fields.get("user"),
-        device_id=source_id,
+        device_id=None,
         app_id=None,
         src_endpoint=src_ip,
         dst_endpoint=dst_ip,
@@ -108,6 +108,7 @@ def parse_drain(raw_payload: str, raw_event_id: str, source_id: str) -> Normaliz
         extensions={
             **labels.unlabeled,
             **leftover_labeled,  # e.g. a labeled "port" or "mac" — never silently lost
+            "source_id": source_id,
             "drain_template": result.template,
             "drain_cluster_id": result.cluster_id,
         },
