@@ -113,7 +113,18 @@ class FakeES:
             target = doc.get("published_count", 0)
             if done >= target:
                 doc["completed_at"] = params["now"]
-                doc["status"] = "partial" if doc.get("failed_count", 0) else "completed"
+                # Mirrors _TALLY_RUN's three terminal states exactly. A run
+                # where nothing recovered is `failed`, not `partial` -- keep
+                # this in step with the script or the suite stops describing
+                # what production actually does.
+                recovered = doc.get("recovered_count", 0)
+                failed = doc.get("failed_count", 0)
+                if failed == 0:
+                    doc["status"] = "completed"
+                elif recovered == 0:
+                    doc["status"] = "failed"
+                else:
+                    doc["status"] = "partial"
             else:
                 doc["status"] = "running"
             return {"_id": id}
@@ -370,9 +381,9 @@ def test_failed_replay_stays_unresolved_and_increments_count():
     stored = es.data[RUNS_INDEX][run.reprocess_id]
     assert stored["failed_count"] == 1
     assert stored["recovered_count"] == 0
-    # A run where everything failed is 'partial' only if some succeeded; here
-    # nothing recovered, so it must not claim a clean completion.
-    assert stored["status"] == "partial"
+    # A run where everything failed is 'failed', not 'partial': 'partial' is
+    # reserved for a genuine mix, and 'completed' would claim a clean sweep.
+    assert stored["status"] == "failed"
 
 
 def test_failed_replay_creates_no_silver_document():

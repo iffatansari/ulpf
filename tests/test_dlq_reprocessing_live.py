@@ -175,3 +175,67 @@ def test_tally_run_completes_when_every_published_event_reports(es):
     # Some recovered, some failed -> partial, and the run is closed out.
     assert doc["status"] == "partial"
     assert doc["completed_at"] is not None
+
+
+def _tally(es, run_id, outcome):
+    es.update(
+        index=PROBE_INDEX,
+        id=run_id,
+        retry_on_conflict=3,
+        body={"script": {**_TALLY_RUN, "params": {"outcome": outcome, "now": _now()}}},
+    )
+    return es.get(index=PROBE_INDEX, id=run_id)["_source"]
+
+
+def test_tally_run_reports_failed_when_nothing_recovered(es):
+    """
+    A run in which every replay failed again is `failed`, not `partial`.
+
+    `partial` means "some recovered, some did not". Reporting it when
+    recovered_count is 0 tells the operator that part of their replay worked
+    when none of it did -- and the UI now renders this status verbatim, so the
+    operator would read a total failure as a partial success. The most common
+    case is the single-record replay that fails again, which is exactly the
+    case `partial` mislabels.
+    """
+    es.index(index=PROBE_INDEX, id="run-all-failed", body={"published_count": 1})
+
+    doc = _tally(es, "run-all-failed", "failed")
+
+    assert doc["failed_count"] == 1
+    assert doc.get("recovered_count", 0) == 0
+    assert doc["status"] == "failed"
+    # Terminal, so the UI's poller stops instead of waiting forever.
+    assert doc["completed_at"] is not None
+
+
+def test_tally_run_reports_failed_for_a_multi_event_all_failed_run(es):
+    """
+    Same rule at batch scale, so a 1000-record run that recovers nothing is
+    never mistaken for a partial success.
+    """
+    es.index(index=PROBE_INDEX, id="run-all-failed-3", body={"published_count": 3})
+
+    for _ in range(3):
+        doc = _tally(es, "run-all-failed-3", "failed")
+
+    assert doc["failed_count"] == 3
+    assert doc["status"] == "failed"
+
+
+def test_tally_run_stays_partial_when_only_some_recover(es):
+    """
+    The `partial` case is preserved: a genuine mix is still `partial`.
+    Guards against over-correcting the fix above into a blunt "any failure is
+    failed", which would hide partial recoveries from the operator.
+    """
+    es.index(index=PROBE_INDEX, id="run-mixed", body={"published_count": 3})
+
+    _tally(es, "run-mixed", "recovered")
+    doc = _tally(es, "run-mixed", "failed")
+    assert doc["status"] == "running", "not closed until every target reports"
+    doc = _tally(es, "run-mixed", "failed")
+
+    assert doc["recovered_count"] == 1
+    assert doc["failed_count"] == 2
+    assert doc["status"] == "partial"

@@ -355,9 +355,17 @@ _TALLY_RUN = {
         "int done = (ctx._source.recovered_count == null ? 0 : ctx._source.recovered_count) "
         "+ (ctx._source.failed_count == null ? 0 : ctx._source.failed_count); "
         "int target = ctx._source.published_count == null ? 0 : ctx._source.published_count; "
+        # Three distinct terminal states, not two. `partial` means "some
+        # recovered, some did not", so a run where nothing recovered is
+        # `failed`. Folding those two together reported a total failure as a
+        # partial success, and the UI renders this status verbatim -- so an
+        # operator replaying one record that failed again was told part of the
+        # work landed. `completed` stays reserved for a clean sweep.
         "if (done >= target) { ctx._source.completed_at = params.now; "
-        "ctx._source.status = (ctx._source.failed_count == null ? 0 : ctx._source.failed_count) > 0 "
-        "? 'partial' : 'completed'; } else { ctx._source.status = 'running'; }"
+        "int rec = ctx._source.recovered_count == null ? 0 : ctx._source.recovered_count; "
+        "int fail = ctx._source.failed_count == null ? 0 : ctx._source.failed_count; "
+        "ctx._source.status = fail == 0 ? 'completed' : (rec == 0 ? 'failed' : 'partial'); "
+        "} else { ctx._source.status = 'running'; }"
     ),
 }
 
