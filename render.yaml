@@ -1,0 +1,204 @@
+services:
+  # ------------------------------------------------------------------
+  # OpenSearch - required datastore. MUST stay private: the security
+  # plugin is disabled, so any public exposure is an open data store.
+  # ------------------------------------------------------------------
+  - type: pserv
+    name: opensearch
+    runtime: docker
+    dockerfilePath: ./deploy/opensearch.Dockerfile
+    dockerContext: .
+    plan: 1c-2g
+    disk:
+      name: opensearch-data
+      mountPath: /usr/share/opensearch/data
+      sizeGB: 10
+    envVars:
+      - key: discovery.type
+        value: single-node
+      - key: plugins.security.disabled
+        value: "true"
+      # Heap must stay at or below 50% of plan RAM (2 GB plan).
+      - key: OPENSEARCH_JAVA_OPTS
+        value: -Xms1g -Xmx1g
+    maxShutdownDelaySeconds: 120
+
+  # ------------------------------------------------------------------
+  # Redpanda - Kafka-compatible event bus. Private, single node, no
+  # auth (safe: no public route). Persisted to disk.
+  # ------------------------------------------------------------------
+  - type: pserv
+    name: redpanda
+    runtime: docker
+    dockerfilePath: ./deploy/redpanda.Dockerfile
+    dockerContext: .
+    plan: 1c-2g
+    disk:
+      name: redpanda-data
+      mountPath: /var/lib/redpanda/data
+      sizeGB: 10
+    dockerCommand: >-
+      redpanda start
+      --smp 1
+      --memory 2G
+      --reserve-memory 0M
+      --overprovisioned
+      --node-id 0
+      --check=false
+      --kafka-addr PLAINTEXT://0.0.0.0:9092
+      --advertise-kafka-addr PLAINTEXT://redpanda:9092
+    maxShutdownDelaySeconds: 120
+
+  # ------------------------------------------------------------------
+  # File collector - internal only. Receives upload bytes from the API
+  # and publishes to the raw topic. Ephemeral filesystem is fine: the
+  # in-flight file is only needed while it is being processed.
+  # NOTE: requires the API -> collector handoff to send file bytes.
+  # See DEPLOY_RENDER.md.
+  # ------------------------------------------------------------------
+  - type: pserv
+    name: file_collector
+    runtime: docker
+    dockerfilePath: ./collectors/file_collector/Dockerfile
+    dockerContext: .
+    plan: 0.5c-512mb
+    envVars:
+      - key: REDPANDA_BROKER
+        value: redpanda:9092
+      - key: RAW_TOPIC
+        value: logs.raw
+      - key: COLLECTOR_ID
+        value: file-collector-1
+      - key: FILE_PORT
+        value: "8082"
+      - key: UPLOAD_DIR
+        value: /data/uploads
+      - key: OPENSEARCH_URL
+        value: http://opensearch:9200
+      - key: UPLOADS_INDEX
+        value: ulpf-uploads
+    maxShutdownDelaySeconds: 60
+
+  # ------------------------------------------------------------------
+  # API - private service. Reached only over Render's private network
+  # at http://api:8000, so the UI can use a literal URL and no
+  # CORS entry is required for normal browsing.
+  # ------------------------------------------------------------------
+  - type: pserv
+    name: api
+    runtime: docker
+    dockerfilePath: ./api/Dockerfile
+    dockerContext: .
+    plan: 0.5c-512mb
+    disk:
+      name: api-uploads
+      mountPath: /data/uploads
+      sizeGB: 10
+    envVars:
+      - key: REDPANDA_BROKER
+        value: redpanda:9092
+      - key: RAW_TOPIC
+        value: logs.raw
+      - key: NORMALIZED_TOPIC
+        value: logs.normalized
+      - key: OPENSEARCH_URL
+        value: http://opensearch:9200
+      - key: SILVER_INDEX
+        value: ulpf-silver
+      - key: DLQ_INDEX
+        value: ulpf-dlq
+      - key: BRONZE_INDEX
+        value: ulpf-bronze
+      - key: SOURCES_INDEX
+        value: ulpf-sources
+      - key: UPLOADS_INDEX
+        value: ulpf-uploads
+      - key: REPROCESS_RUNS_INDEX
+        value: ulpf-reprocess-runs
+      - key: UPLOAD_DIR
+        value: /data/uploads
+      - key: FILE_COLLECTOR_URL
+        value: http://file_collector:8082
+      - key: CORS_ORIGINS
+        value: "*"
+      - key: MAX_UPLOAD_MB
+        value: "100"
+    maxShutdownDelaySeconds: 60
+
+  # ------------------------------------------------------------------
+  # HTTP JSON collector - PUBLIC web service. This is the log ingest
+  # endpoint, so it must be internet-reachable. WARNING: it is
+  # unauthenticated. Anyone who finds the URL can write events.
+  # See DEPLOY_RENDER.md for putting auth in front of it.
+  # ------------------------------------------------------------------
+  - type: web
+    name: http-json-collector
+    runtime: docker
+    dockerfilePath: ./collectors/http_json_collector/Dockerfile
+    dockerContext: .
+    plan: 0.5c-512mb
+    envVars:
+      - key: REDPANDA_BROKER
+        value: redpanda:9092
+      - key: RAW_TOPIC
+        value: logs.raw
+      - key: COLLECTOR_ID
+        value: http-json-collector-1
+      - key: DEFAULT_SOURCE_ID
+        value: http-json-source-1
+      - key: DEFAULT_SOURCE_TYPE
+        value: application
+      - key: HTTP_PORT
+        value: "8081"
+    maxShutdownDelaySeconds: 60
+
+  # ------------------------------------------------------------------
+  # Orchestrator - long-running Kafka consumer. Must be a worker: it
+  # has to stay connected, so it cannot scale to zero.
+  # ------------------------------------------------------------------
+  - type: worker
+    name: orchestrator
+    runtime: docker
+    dockerfilePath: ./orchestrator/Dockerfile
+    dockerContext: .
+    plan: 0.5c-512mb
+    envVars:
+      - key: REDPANDA_BROKER
+        value: redpanda:9092
+      - key: RAW_TOPIC
+        value: logs.raw
+      - key: NORMALIZED_TOPIC
+        value: logs.normalized
+      - key: DLQ_TOPIC
+        value: logs.dlq
+      - key: OPENSEARCH_URL
+        value: http://opensearch:9200
+      - key: SILVER_INDEX
+        value: ulpf-silver
+      - key: DLQ_INDEX
+        value: ulpf-dlq
+      - key: BRONZE_INDEX
+        value: ulpf-bronze
+      - key: REPROCESS_RUNS_INDEX
+        value: ulpf-reprocess-runs
+    maxShutdownDelaySeconds: 120
+
+  # ------------------------------------------------------------------
+  # UI - the only public surface. Express serves the SPA and proxies
+  # /backend to the private api service.
+  # ------------------------------------------------------------------
+  - type: web
+    name: ui
+    runtime: docker
+    dockerfilePath: ./ui/Dockerfile
+    dockerContext: ./ui
+    plan: 0.5c-512mb
+    healthCheckPath: /api/ping
+    envVars:
+      - key: PORT
+        value: "3000"
+      - key: PING_MESSAGE
+        value: ping pong
+      - key: BACKEND_URL
+        value: http://api:8000
+    maxShutdownDelaySeconds: 60
