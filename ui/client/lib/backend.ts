@@ -173,6 +173,11 @@ export interface BackendParserTestResult {
   event?: Record<string, unknown> | null;
   /** Present for custom parsers: what the declarative field rules extracted. */
   extracted?: Record<string, string>;
+  /**
+   * Present for custom parsers: the rules that matched nothing. Without it a
+   * rule that silently extracts nothing looks exactly like one that works.
+   */
+  misses?: string[];
   error?: string | null;
   /** Why a parser declined a sample, or what kind of result this is. */
   reason?: string | null;

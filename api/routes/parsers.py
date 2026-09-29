@@ -355,7 +355,7 @@ def test_parser(
         }
     else:
         rules = record.get("field_rules") or []
-        extracted, errors = registry.extract_field_rules(payload.sample, rules)
+        extracted, errors, misses = registry.extract_field_rules(payload.sample, rules)
         result = {
             "parser_id": payload.parser_id,
             "matched": bool(extracted),
@@ -369,6 +369,8 @@ def test_parser(
         }
         if errors:
             result["errors"] = errors
+        if misses:
+            result["misses"] = misses
 
     _record_test(client, payload.parser_id, result)
     return result

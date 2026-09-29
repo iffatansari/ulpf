@@ -261,7 +261,7 @@ def build_parser(record: Dict[str, Any]) -> Optional[Callable[..., Optional[Norm
         raw_event_id: str,
         source_id: str,
     ) -> Optional[NormalizedEvent]:
-        extracted, _errors = extract_field_rules(raw_payload, rules)
+        extracted, _errors, _misses = extract_field_rules(raw_payload, rules)
         if not extracted:
             return None
         return _to_event(parser_id, extracted, raw_event_id, source_id)

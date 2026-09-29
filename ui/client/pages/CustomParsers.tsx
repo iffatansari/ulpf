@@ -346,6 +346,12 @@ export default function CustomParsers() {
                     {result.error && (
                       <p className="text-xs text-rose-500">Parser error: {result.error}</p>
                     )}
+                    {result.misses && result.misses.length > 0 && (
+                      <p className="text-xs text-amber-500">
+                        No match for {result.misses.length === 1 ? "rule" : "rules"}:{" "}
+                        <span className="font-mono">{result.misses.join(", ")}</span>
+                      </p>
+                    )}
                     {result.extracted && Object.keys(result.extracted).length > 0 && (
                       <div className="overflow-hidden rounded-lg border border-border">
                         <div className="grid grid-cols-[120px_minmax(0,1fr)] gap-2 border-b border-border bg-muted/50 px-3 py-1.5 font-mono text-[10px] font-bold uppercase tracking-wider text-muted-foreground">

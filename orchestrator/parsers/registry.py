@@ -141,18 +141,76 @@ MAX_PATTERN_CHARS = 512
 MAX_RULE_NAME_CHARS = 128
 
 
+# Rules run case-insensitively and anchored per line. Neither is the author's
+# problem to solve: a vendor fleet sends `User=`, `user=` and `USER=` for the
+# same field, and ^ on a rule means "start of the log line", which is not the
+# start of the string when the payload or the pasted sample carries more than
+# one line. Without MULTILINE an anchored rule quietly matches the first line
+# and extracts the wrong value, which is worse than not matching at all.
+_RULE_FLAGS = re.IGNORECASE | re.MULTILINE
+
+# Punctuation that belongs to the line rather than to the value. \S+ stops at
+# whitespace, not at a comma, so `for alice, from 10.1.1.5,` extracts
+# "alice," -- and "10.1.1.5," fails every value check downstream, so the
+# address lands in extensions instead of src_endpoint.
+_TRAILING_NOISE = ",;."
+
+
+def _clean_value(value: str) -> str:
+    """
+    Strip the quoting and line punctuation a capture drags in with it.
+
+    A quoted kv-pair carries its quotes only because the log format used
+    them; they are not part of the field, and a quoted timestamp does not
+    parse as a timestamp.
+    """
+    text = (value or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1]
+    return text.strip().rstrip(_TRAILING_NOISE).strip()
+
+
+def _captured(match: "re.Match") -> str:
+    """
+    The first capture group that actually took part, else the whole match.
+
+    Not "group 1". An alternation is the natural way to accept a field that
+    is sometimes quoted and sometimes not, and it puts the two branches in
+    different groups: for `k="([^"]*)"|k=(\\S+)` only one of the two
+    participates, so reading group 1 yields None for every unquoted value.
+    That is the rule the UI generates for every key an operator types, and
+    it meant a parser built in the browser extracted nothing from a plain
+    `level=error` while the same parser worked on a quoted sample.
+    """
+    for group in match.groups():
+        if group is not None:
+            return group
+    return match.group(0)
+
+
 def extract_field_rules(
     sample: str, field_rules: List[Dict[str, Any]]
-) -> Tuple[Dict[str, str], List[str]]:
+) -> Tuple[Dict[str, str], List[str], List[str]]:
     """
     Run declarative field rules over a sample line.
 
-    Returns (extracted, errors). A rule whose pattern will not compile is
-    reported in `errors` and skipped, so one bad rule does not void the rest.
-    A rule with a capture group yields group 1; otherwise the whole match.
+    Returns (extracted, errors, misses). A rule whose pattern will not
+    compile is reported in `errors` and skipped, so one bad rule does not
+    void the rest. A rule that matched nothing usable is named in `misses`:
+    a rule that silently extracts nothing is indistinguishable from a
+    working one, and "which of my five rules is wrong" is the whole
+    question when extraction looks broken.
+
+    A rule that matched but yielded no value -- an optional group that did
+    not participate, or a capture that was only punctuation -- is a miss
+    too. Writing it as an empty field would let a rule set that extracted
+    nothing claim the format, which is the one answer a custom parser must
+    never give.
     """
     extracted: Dict[str, str] = {}
     errors: List[str] = []
+    misses: List[str] = []
+    haystack = sample[:MAX_SAMPLE_CHARS]
 
     for rule in list(field_rules or [])[:MAX_FIELD_RULES]:
         name = (rule or {}).get("name")
@@ -167,17 +225,22 @@ def extract_field_rules(
             errors.append(f"pattern too long for rule {name}")
             continue
         try:
-            compiled = re.compile(str(pattern))
+            compiled = re.compile(str(pattern), _RULE_FLAGS)
         except re.error as exc:
             errors.append(f"rule {name}: invalid pattern ({exc})")
             continue
         try:
-            match = compiled.search(sample[:MAX_SAMPLE_CHARS])
+            match = compiled.search(haystack)
         except Exception as exc:  # pragma: no cover - defensive
             errors.append(f"rule {name}: match failed ({exc})")
             continue
         if match is None:
+            misses.append(str(name))
             continue
-        extracted[str(name)] = match.group(1) if match.groups() else match.group(0)
+        value = _clean_value(_captured(match))
+        if not value:
+            misses.append(str(name))
+            continue
+        extracted[str(name)] = value
 
-    return extracted, errors
+    return extracted, errors, misses
