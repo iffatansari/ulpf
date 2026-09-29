@@ -30,7 +30,7 @@ def test_create_source_accepts_valid_file_source():
 
 
 @pytest.mark.parametrize(
-    "transport", ["udp", "http", "file", "other"]
+    "transport", ["udp", "http", "file", "sse", "other"]
 )
 def test_allowed_transports(transport):
     source = SourceCreate(

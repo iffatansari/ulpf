@@ -1,6 +1,5 @@
 import "dotenv/config";
 import express from "express";
-import cors from "cors";
 import { handleBackend } from "./routes/backend";
 import { handleDemo } from "./routes/demo";
 import { handleNormalize } from "./routes/normalize";
@@ -9,8 +8,6 @@ export function createServer() {
   const app = express();
 
   // Middleware
-  app.use(cors());
-
   // Same-origin proxy → FastAPI (must stay before the body parsers so
   // multipart uploads reach the backend untouched).
   app.use("/backend", handleBackend);

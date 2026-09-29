@@ -11,7 +11,7 @@ import { FORMATS, SAMPLES } from "@/lib/samples";
 import { useNormalizer } from "@/lib/normalize-context";
 import { cn } from "@/lib/utils";
 
-export default function NormalizerForm({ compact = false, onDone }: { compact?: boolean; onDone?: () => void }) {
+export default function NormalizerForm({ onDone }: { onDone?: () => void }) {
   const { run, loading } = useNormalizer();
   const [content, setContent] = useState("");
   const [sourceName, setSourceName] = useState("");
@@ -47,22 +47,20 @@ export default function NormalizerForm({ compact = false, onDone }: { compact?: 
       <CardHeader className="pb-4">
         <div className="flex items-center justify-between">
           <CardTitle className="text-base">Input</CardTitle>
-          {!compact && (
-            <div className="flex gap-1 rounded-md border border-border bg-muted/60 p-0.5">
-              <button
-                onClick={() => setMode("paste")}
-                className={cn("rounded px-2.5 py-1 text-xs font-medium transition-colors", mode === "paste" ? "bg-card shadow-sm" : "text-muted-foreground")}
-              >
-                Paste
-              </button>
-              <button
-                onClick={() => setMode("upload")}
-                className={cn("rounded px-2.5 py-1 text-xs font-medium transition-colors", mode === "upload" ? "bg-card shadow-sm" : "text-muted-foreground")}
-              >
-                Upload file
-              </button>
-            </div>
-          )}
+          <div className="flex gap-1 rounded-md border border-border bg-muted/60 p-0.5">
+            <button
+              onClick={() => setMode("paste")}
+              className={cn("rounded px-2.5 py-1 text-xs font-medium transition-colors", mode === "paste" ? "bg-card shadow-sm" : "text-muted-foreground")}
+            >
+              Paste
+            </button>
+            <button
+              onClick={() => setMode("upload")}
+              className={cn("rounded px-2.5 py-1 text-xs font-medium transition-colors", mode === "upload" ? "bg-card shadow-sm" : "text-muted-foreground")}
+            >
+              Upload file
+            </button>
+          </div>
         </div>
         <CardDescription>Roughly one event per line. Pretty-printed JSON is coalesced automatically. Real values only — nothing is fabricated.</CardDescription>
       </CardHeader>
@@ -89,7 +87,7 @@ export default function NormalizerForm({ compact = false, onDone }: { compact?: 
           </div>
         </div>
 
-        {!compact && mode === "upload" && (
+        {mode === "upload" && (
           <div className="mt-3">
             <input ref={fileInput} type="file" className="hidden" accept=".log,.txt,.json,.cef,.evtx" onChange={(e) => onFile(e.target.files?.[0] ?? null)} />
             <button
@@ -109,7 +107,7 @@ export default function NormalizerForm({ compact = false, onDone }: { compact?: 
           value={content}
           onChange={(e) => setContent(e.target.value)}
           placeholder={'Paste syslog, JSON, CEF, LEEF, key=value, Apache/Nginx lines here…\n\nExample:\n<34>1 2024-01-22T12:42:48Z web1 sshd 2321 - - "Failed password for admin…"'}
-          className={cn("mt-3 w-full resize-y font-mono text-xs leading-relaxed", compact ? "min-h-[130px]" : "min-h-[220px]")}
+          className="mt-3 w-full resize-y font-mono text-xs leading-relaxed min-h-[220px]"
           spellCheck={false}
         />
 
@@ -131,7 +129,7 @@ export default function NormalizerForm({ compact = false, onDone }: { compact?: 
           </div>
           <Button onClick={submit} disabled={loading || !content.trim()} className="bg-gradient-to-r from-[#2f8ce0] to-[#7c4dcc] text-white shadow-lg shadow-[#2f8ce0]/25 hover:from-[#2a7fd1] hover:to-[#6f44bd]">
             {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-            {compact ? "Normalize" : "Normalize to OCSF"}
+            Normalize to OCSF
           </Button>
         </div>
       </CardContent>

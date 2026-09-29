@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from typing import Optional, Any, Dict
 
 from schema.normalized_event import NormalizedEvent
+from parsers.severity import severity_from_number, severity_from_text
 
 
 def parse_json_log(raw_payload: str, raw_event_id: str, source_id: str) -> Optional[NormalizedEvent]:
@@ -37,15 +38,17 @@ def parse_json_log(raw_payload: str, raw_event_id: str, source_id: str) -> Optio
     user = data.get("user") or data.get("username")
     action = data.get("action") or data.get("event") or data.get("activity")
     src_ip = data.get("src_ip") or data.get("source_ip") or data.get("client_ip")
-    severity_raw = data.get("level") or data.get("severity") or "INFO"
+    severity_raw = data.get("level")
+    if severity_raw is None:
+        severity_raw = data.get("severity")
+    if severity_raw is None:
+        severity_raw = "INFO"
 
-    severity = "low"
-    if isinstance(severity_raw, str):
-        s = severity_raw.lower()
-        if s in ("error", "err", "critical", "crit"):
-            severity = "high"
-        elif s in ("warn", "warning"):
-            severity = "medium"
+    severity = severity_from_number(severity_raw)
+    if severity is None:
+        severity = severity_from_text(severity_raw)
+    if severity is None:
+        severity = "low"
 
     return NormalizedEvent(
         event_id=f"{raw_event_id}-norm",

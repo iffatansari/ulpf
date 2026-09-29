@@ -13,7 +13,7 @@ class NormalizedEvent(BaseModel):
     event_id: str = Field(..., description="Unique ID for the normalized event")
     raw_event_id: str = Field(..., description="Reference to the raw event in Bronze")
     parser_id: str = Field(..., description="Which parser produced this normalization")
-    parser_tier: Literal["primary", "generic", "fallback", "drain3"] = Field(
+    parser_tier: Literal["primary", "generic", "custom", "fallback", "drain3"] = Field(
         ..., description="Parser tier used (for confidence & lineage)"
     )
     confidence_score: float = Field(

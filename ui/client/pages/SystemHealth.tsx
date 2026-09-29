@@ -32,7 +32,9 @@ export default function SystemHealth() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const activeParsers = PARSERS.filter((p) => p.id !== "text").length;
+  // The Drain3 fallback runs last, so the real "modules" count is every
+  // registered parser including it.
+  const activeParsers = PARSERS.length;
 
   return (
     <>

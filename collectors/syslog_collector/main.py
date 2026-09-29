@@ -12,7 +12,12 @@ from schema.raw_event import RawEventEnvelope
 REDPANDA_BROKER = os.getenv("REDPANDA_BROKER", "redpanda:29092")
 RAW_TOPIC = os.getenv("RAW_TOPIC", "logs.raw")
 COLLECTOR_ID = os.getenv("COLLECTOR_ID", "syslog-collector-1")
+SOURCE_ID = os.getenv("SOURCE_ID", os.getenv("ULPF_SOURCE_ID", "syslog-source-1"))
+SOURCE_TYPE = os.getenv("SOURCE_TYPE", os.getenv("ULPF_SOURCE_TYPE", "server"))
 SYSLOG_PORT = int(os.getenv("SYSLOG_PORT", "1514"))
+SYSLOG_TCP_PORT = int(os.getenv("SYSLOG_TCP_PORT", "5151"))
+MAX_IN_FLIGHT = max(1, int(os.getenv("SYSLOG_MAX_IN_FLIGHT", "100")))
+MAX_TCP_LINE_BYTES = max(1024, int(os.getenv("SYSLOG_MAX_TCP_LINE_BYTES", str(1024 * 1024))))
 
 
 def detect_log_format(line: str) -> str:
@@ -79,10 +84,40 @@ class SyslogUDPProtocol(asyncio.DatagramProtocol):
     avoiding the continuous polling loop used previously.
     """
 
-    def __init__(self, producer: AIOKafkaProducer):
+    def __init__(
+        self,
+        producer: AIOKafkaProducer,
+        source_id: str = SOURCE_ID,
+        source_type: str = SOURCE_TYPE,
+    ):
         self.producer = producer
-        self.default_source_id = "syslog-source-1"
-        self.default_source_type = "server"
+        self.default_source_id = source_id
+        self.default_source_type = source_type
+        self.semaphore = asyncio.Semaphore(MAX_IN_FLIGHT)
+        self.tasks: set[asyncio.Task[None]] = set()
+
+    async def send(self, line: str, transport: str) -> None:
+        async with self.semaphore:
+            await send_raw_event(
+                self.producer,
+                line,
+                source_id=self.default_source_id,
+                source_type=self.default_source_type,
+                transport=transport,
+                format_hint=detect_log_format(line),
+            )
+
+    def enqueue(self, line: str, transport: str) -> None:
+        task = asyncio.create_task(self.send(line, transport))
+        self.tasks.add(task)
+        task.add_done_callback(self.task_done)
+
+    def task_done(self, task: asyncio.Task[None]) -> None:
+        self.tasks.discard(task)
+        if not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                print(f"Syslog delivery failed: {exc}", flush=True)
 
     def datagram_received(self, data: bytes, addr) -> None:
         line = data.decode("utf-8", errors="replace").strip()
@@ -92,29 +127,34 @@ class SyslogUDPProtocol(asyncio.DatagramProtocol):
             flush=True,
         )
 
-        detected_format = detect_log_format(line)
-
-        print(
-            f"Detected format: {detected_format}",
-            flush=True,
-        )
-
-        asyncio.ensure_future(
-            send_raw_event(
-                self.producer,
-                line,
-                source_id=self.default_source_id,
-                source_type=self.default_source_type,
-                transport="udp",
-                format_hint=detected_format,
-            )
-        )
+        self.enqueue(line, "udp")
 
     def error_received(self, exc: Exception) -> None:
         print(
             f"Syslog collector socket error: {exc}",
             flush=True,
         )
+
+
+async def handle_tcp_client(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    protocol: SyslogUDPProtocol,
+) -> None:
+    try:
+        while True:
+            line = await reader.readline()
+            if not line:
+                break
+            if len(line) > MAX_TCP_LINE_BYTES:
+                print("Ignoring oversized TCP syslog line", flush=True)
+                continue
+            text = line.decode("utf-8", errors="replace").strip()
+            if text:
+                protocol.enqueue(text, "tcp")
+    finally:
+        writer.close()
+        await writer.wait_closed()
 
 
 async def main():
@@ -126,13 +166,18 @@ async def main():
 
     loop = asyncio.get_running_loop()
 
-    transport, _protocol = await loop.create_datagram_endpoint(
+    transport, protocol = await loop.create_datagram_endpoint(
         lambda: SyslogUDPProtocol(producer),
         local_addr=("0.0.0.0", SYSLOG_PORT),
     )
+    tcp_server = await asyncio.start_server(
+        lambda reader, writer: handle_tcp_client(reader, writer, protocol),
+        host="0.0.0.0",
+        port=SYSLOG_TCP_PORT,
+    )
 
     print(
-        f"Syslog collector listening on UDP {SYSLOG_PORT}",
+        f"Syslog collector listening on UDP {SYSLOG_PORT} and TCP {SYSLOG_TCP_PORT}",
         flush=True,
     )
 
@@ -140,7 +185,14 @@ async def main():
         await asyncio.Event().wait()
 
     finally:
+        tcp_server.close()
+        await tcp_server.wait_closed()
         transport.close()
+        pending = tuple(protocol.tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         await producer.stop()
 
 

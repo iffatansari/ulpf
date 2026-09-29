@@ -6,26 +6,41 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { PageHeader, StatChip } from "@/components/common/bits";
 import { ACCENT } from "@/lib/accents";
+import type { SourcePerSourceStats } from "@/lib/backend";
 import { TRANSPORTS, useSources } from "@/lib/source-context";
+import { useNormalizedFeed } from "@/lib/normalized-feed";
 
 export default function Sources() {
   const { sources, removeSource, loadDemo, sourceType } = useSources();
 
-  const totals = useMemo(() => {
-    let accepted = 0;
-    let rejected = 0;
-    let rescued = 0;
-    let lines = 0;
-    for (const s of sources) {
-      if (s.lastRun) {
-        accepted += s.lastRun.accepted;
-        rejected += s.lastRun.rejected;
-        rescued += s.lastRun.rescued;
-        lines += s.lastRun.total;
-      }
-    }
-    return { accepted, rejected, rescued, lines };
-  }, [sources]);
+  // Per-source counts come from the same /stats aggregate every other
+  // section reads, keyed on the source_ids actually present in the data
+  // rather than on the registry. The previous version fanned out one
+  // request per registered source every ten seconds and added the results
+  // up, which meant the page total was a subset of the dashboard total
+  // whenever an event carried a source_id nobody had registered -- and
+  // "Events (normalized)" then quietly disagreed with the Dashboard.
+  const { summary } = useNormalizedFeed();
+  const statsById = useMemo(() => {
+    const map: Record<string, SourcePerSourceStats> = {};
+    for (const row of summary.perSource) map[row.source_id] = row;
+    return map;
+  }, [summary.perSource]);
+
+  const attributed = useMemo(
+    () =>
+      sources.reduce((sum, s) => {
+        const stats = statsById[s.id];
+        if (stats) return sum + stats.normalized_events;
+        return sum + (s.lastRun?.accepted ?? 0);
+      }, 0),
+    [sources, statsById],
+  );
+
+  // Events attributed to a source_id with no registry entry. Showing the
+  // headline from the aggregate and silently keeping this difference is
+  // how the two pages drifted; naming it is the honest option.
+  const unattributed = Math.max(summary.events - attributed, 0);
 
   return (
     <>
@@ -48,10 +63,18 @@ export default function Sources() {
 
       <div className="mb-5 grid grid-cols-2 gap-2 sm:grid-cols-4">
         <StatChip icon={Server} label="Sources" value={sources.length} color={ACCENT.blue} tone="text-[#25263A]" />
-        <StatChip icon={CheckCircle2} label="Events (last runs)" value={totals.accepted} color="#2f8ce0" tone={totals.accepted ? "text-emerald-600" : "text-[#A6AABF]"} />
-        <StatChip icon={RadioTower} label="Rescued by fallback" value={totals.rescued} color="#7c4dcc" tone={totals.rescued ? "text-[#25263A]" : "text-[#A6AABF]"} />
-        <StatChip icon={HardDriveDownload} label="DLQ lines" value={totals.rejected} color="#e11d48" tone={totals.rejected ? "text-rose-600" : "text-[#A6AABF]"} />
+        <StatChip icon={CheckCircle2} label="Events (normalized)" value={summary.events} color="#2f8ce0" tone={summary.events ? "text-emerald-600" : "text-[#A6AABF]"} />
+        <StatChip icon={RadioTower} label="Rescued by fallback" value={summary.rescued ?? 0} color="#7c4dcc" tone={summary.rescued ? "text-[#25263A]" : "text-[#A6AABF]"} />
+        <StatChip icon={HardDriveDownload} label="DLQ lines" value={summary.rejected} color="#e11d48" tone={summary.rejected ? "text-rose-600" : "text-[#A6AABF]"} />
       </div>
+
+      {unattributed > 0 && (
+        <p className="mb-5 font-mono text-[11px] text-muted-foreground">
+          {unattributed.toLocaleString()} event{unattributed === 1 ? "" : "s"} carry a
+          source_id that is not in the registry, so no card below claims them. They are
+          included in the totals above.
+        </p>
+      )}
 
       {sources.length === 0 && (
         <div className="flex flex-col items-start gap-3 rounded-xl border border-dashed border-border bg-card/50 px-6 py-10">
@@ -115,15 +138,31 @@ export default function Sources() {
                   </span>
                 </div>
 
-                {s.lastRun ? (
-                  <div className="mt-3 grid grid-cols-3 gap-1.5">
-                    <MiniStat label="events" value={s.lastRun.accepted} tone={`bg-[#E8F4FF] text-[#2f8ce0]`} />
-                    <MiniStat label="rescued" value={s.lastRun.rescued} tone={`bg-[#F0ECFF] text-[#7c4dcc]`} />
-                    <MiniStat label="dlq" value={s.lastRun.rejected} tone={`bg-[#FFE1E6] text-[#e11d48]`} />
-                  </div>
-                ) : (
-                  <p className="mt-3 text-[11px] text-muted-foreground">No ingestion from this source yet.</p>
-                )}
+                {(() => {
+                  const stats = statsById[s.id];
+                  const mini = stats
+                    ? {
+                        events: stats.normalized_events,
+                        rescued: stats.rescued,
+                        dlq: stats.dlq_events,
+                      }
+                    : s.lastRun
+                      ? {
+                          events: s.lastRun.accepted,
+                          rescued: s.lastRun.rescued,
+                          dlq: s.lastRun.rejected,
+                        }
+                      : null;
+                  return mini ? (
+                    <div className="mt-3 grid grid-cols-3 gap-1.5">
+                      <MiniStat label="events" value={mini.events} tone={`bg-[#E8F4FF] text-[#2f8ce0]`} />
+                      <MiniStat label="rescued" value={mini.rescued} tone={`bg-[#F0ECFF] text-[#7c4dcc]`} />
+                      <MiniStat label="dlq" value={mini.dlq} tone={`bg-[#FFE1E6] text-[#e11d48]`} />
+                    </div>
+                  ) : (
+                    <p className="mt-3 text-[11px] text-muted-foreground">No ingestion from this source yet.</p>
+                  );
+                })()}
 
                 <div className="mt-3 flex items-center justify-between gap-2 border-t border-border pt-3">
                   <Link to={`/sources/${s.id}`} className="flex items-center gap-1 text-xs font-medium hover:underline" style={{ color }}>

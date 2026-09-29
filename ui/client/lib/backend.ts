@@ -1,4 +1,8 @@
-import type { NormalizedEventResult, OcsfEvent, RejectedEventResult } from "@shared/api";
+import type {
+  NormalizedEventResult,
+  OcsfEvent,
+  RejectedEventResult,
+} from "@shared/api";
 import type { Source, SourceTransportId } from "./source-context";
 
 /**
@@ -63,6 +67,19 @@ export interface BackendNormalizedEvent {
   extensions?: Record<string, unknown>;
 }
 
+/**
+ * One resolved replay attempt, appended to the DLQ record by the API and
+ * never rewritten. `attempt` is derived server-side from the record's own
+ * counter, so it stays correct across separate runs.
+ */
+export interface DlqAttemptEntry {
+  attempt: number;
+  reprocess_id?: string | null;
+  started_at: string;
+  result: "recovered" | "failed";
+  reason?: string | null;
+}
+
 export interface BackendDlqRecord {
   dlq_id: string;
   raw_event_id: string;
@@ -74,6 +91,14 @@ export interface BackendDlqRecord {
   last_attempt_at: string;
   reprocess_count: number;
   metadata?: Record<string, unknown>;
+  // Module 3 recovery audit. `status` above is the ORIGINAL failure
+  // classification and is never overwritten -- "was this event originally a
+  // failure?" must stay answerable after a successful replay.
+  resolution_status?: "unresolved" | "recovered";
+  resolved_at?: string | null;
+  last_reprocess_id?: string | null;
+  replay_reason?: string | null;
+  attempt_history?: DlqAttemptEntry[];
 }
 
 export interface BackendDashboard {
@@ -83,6 +108,50 @@ export interface BackendDashboard {
   uploads: number;
   recent_events: BackendNormalizedEvent[];
   recent_uploads: Record<string, unknown>[];
+}
+
+/**
+ * Every counter the UI renders, from one aggregate on the API.
+ *
+ * This is the only count contract the pages read. Each field is a real
+ * OpenSearch aggregation rather than something tallied in the browser from
+ * a 50-row page of events, which is what used to make the Metrics charts
+ * describe a sample of the data while the stat chip above them claimed to
+ * describe all of it.
+ */
+export interface SourcePerSourceStats {
+  source_id: string;
+  raw_events: number;
+  normalized_events: number;
+  dlq_events: number;
+  rescued: number;
+}
+
+export interface BackendStats {
+  bronze_events: number;
+  silver_events: number;
+  dlq_events: number;
+  dlq_unresolved: number;
+  dlq_recovered: number;
+  dlq_reasons: Record<string, number>;
+  /** Events normalized by drain3-fallback-v1, i.e. rescued off the DLQ path. */
+  rescued: number;
+  parsers: Record<string, number>;
+  tiers: Record<string, number>;
+  classes: Record<string, number>;
+  severities: Record<string, number>;
+  /** Aggregated over Bronze -- the detected format only exists there. */
+  formats: Record<string, number>;
+  /**
+   * One row per source_id found in the data, not per registered source.
+   * Events from an unregistered source_id still count towards
+   * `silver_events`, so a rollup keyed on the registry would be a subset
+   * of the headline number.
+   */
+  per_source: SourcePerSourceStats[];
+  uploads: number;
+  registered_sources: number;
+  reprocess_runs: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +179,130 @@ function jsonInit(method: string, body?: unknown): RequestInit {
 }
 
 // ---------------------------------------------------------------------------
+// Parser registry
+//
+// The registry on the API is the source of truth for which parsers exist and
+// in what order they are tried. The UI never invents a parser list: the ids
+// here are the ones the orchestrator really runs.
+// ---------------------------------------------------------------------------
+
+export type ParserStatus = "active" | "disabled" | "draft";
+
+export interface BackendParserFieldRule {
+  name: string;
+  pattern: string;
+}
+
+export interface BackendParserDoc {
+  parser_id: string;
+  display_name: string;
+  description?: string | null;
+  status: ParserStatus;
+  priority: number;
+  version: number;
+  is_builtin: boolean;
+  source_formats?: string[];
+  field_rules?: BackendParserFieldRule[];
+  sample_payload?: string | null;
+  history?: unknown[];
+  last_test?: BackendParserTestResult | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface BackendParserTestResult {
+  parser_id: string;
+  matched: boolean;
+  /** Present for built-ins: the normalized event the real parser produced. */
+  event?: Record<string, unknown> | null;
+  /** Present for custom parsers: what the declarative field rules extracted. */
+  extracted?: Record<string, string>;
+  /**
+   * Present for custom parsers: the rules that matched nothing. Without it a
+   * rule that silently extracts nothing looks exactly like one that works.
+   */
+  misses?: string[];
+  error?: string | null;
+  /** Why a parser declined a sample, or what kind of result this is. */
+  reason?: string | null;
+  errors?: string[];
+  tested_at?: string;
+}
+
+export async function listBackendParsers(
+  includeDisabled = false,
+): Promise<BackendParserDoc[]> {
+  const data = await backendFetch<{ parsers: BackendParserDoc[] }>(
+    `/parsers?include_disabled=${includeDisabled}`,
+  );
+  return data.parsers ?? [];
+}
+
+export async function getBackendParser(
+  parserId: string,
+): Promise<BackendParserDoc> {
+  return backendFetch<BackendParserDoc>(`/parsers/${parserId}`);
+}
+
+export interface BackendParserCreate {
+  parser_id: string;
+  display_name: string;
+  description?: string;
+  status?: ParserStatus;
+  priority?: number;
+  source_formats?: string[];
+  field_rules?: BackendParserFieldRule[];
+  sample_payload?: string;
+}
+
+export async function createBackendParser(
+  payload: BackendParserCreate,
+): Promise<BackendParserDoc> {
+  return backendFetch<BackendParserDoc>("/parsers", jsonInit("POST", payload));
+}
+
+export async function updateBackendParser(
+  parserId: string,
+  changes: Partial<Omit<BackendParserCreate, "parser_id">>,
+): Promise<BackendParserDoc> {
+  return backendFetch<BackendParserDoc>(
+    `/parsers/${parserId}`,
+    jsonInit("PUT", changes),
+  );
+}
+
+export async function rollbackBackendParser(
+  parserId: string,
+): Promise<BackendParserDoc> {
+  return backendFetch<BackendParserDoc>(
+    `/parsers/${parserId}/rollback`,
+    jsonInit("POST"),
+  );
+}
+
+export async function deleteBackendParser(parserId: string): Promise<void> {
+  await backendFetch<{ deleted: string }>(
+    `/parsers/${parserId}`,
+    jsonInit("DELETE"),
+  );
+}
+
+/**
+ * Run a sample through a real parser on the API. This is the whole point of
+ * the endpoint: a built-in runs the orchestrator's own callable, so the
+ * answer is what the pipeline would actually do.
+ */
+export async function testBackendParser(
+  parserId: string,
+  sample: string,
+): Promise<BackendParserTestResult> {
+  return backendFetch<BackendParserTestResult>(
+    "/parsers/test",
+    jsonInit("POST", { parser_id: parserId, sample }),
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Sources registry
 // ---------------------------------------------------------------------------
 
@@ -127,16 +320,29 @@ export interface BackendSourceCreate {
   description?: string;
 }
 
-export async function createBackendSource(input: BackendSourceCreate): Promise<BackendSourceDoc> {
-  const data = await backendFetch<{ source: BackendSourceDoc }>("/sources", jsonInit("POST", input));
+export async function createBackendSource(
+  input: BackendSourceCreate,
+): Promise<BackendSourceDoc> {
+  const data = await backendFetch<{ source: BackendSourceDoc }>(
+    "/sources",
+    jsonInit("POST", input),
+  );
   return data.source;
 }
 
 export async function updateBackendSource(
   sourceId: string,
-  patch: Partial<Pick<BackendSourceDoc, "name" | "expected_format" | "enabled" | "description">>,
+  patch: Partial<
+    Pick<
+      BackendSourceDoc,
+      "name" | "expected_format" | "enabled" | "description"
+    >
+  >,
 ): Promise<BackendSourceDoc> {
-  const data = await backendFetch<{ source: BackendSourceDoc }>(`/sources/${sourceId}`, jsonInit("PUT", patch));
+  const data = await backendFetch<{ source: BackendSourceDoc }>(
+    `/sources/${sourceId}`,
+    jsonInit("PUT", patch),
+  );
   return data.source;
 }
 
@@ -144,27 +350,313 @@ export async function deleteBackendSource(sourceId: string): Promise<void> {
   await backendFetch<unknown>(`/sources/${sourceId}`, { method: "DELETE" });
 }
 
-export async function getBackendSourceStats(sourceId: string): Promise<SourceStats> {
-  return backendFetch<SourceStats>(`/sources/${sourceId}/stats`);
+export async function getBackendSourceStats(
+  sourceId: string,
+): Promise<SourceStats> {
+  return backendFetch<SourceStats>(
+    `/sources/${encodeURIComponent(sourceId)}/stats`,
+  );
 }
 
 // ---------------------------------------------------------------------------
 // Events & DLQ
 // ---------------------------------------------------------------------------
 
-export async function listBackendEvents(limit = 50): Promise<{ total: number; events: BackendNormalizedEvent[] }> {
-  return backendFetch<{ total: number; events: BackendNormalizedEvent[] }>(`/events?limit=${limit}`);
+export async function listBackendEvents(
+  limit = 50,
+): Promise<{ total: number; events: BackendNormalizedEvent[] }> {
+  return backendFetch<{ total: number; events: BackendNormalizedEvent[] }>(
+    `/events?limit=${limit}`,
+  );
 }
 
-export async function getBackendSourceEvents(sourceId: string, limit = 50): Promise<{ total: number; events: BackendNormalizedEvent[] }> {
-  return backendFetch<{ total: number; events: BackendNormalizedEvent[] }>(`/sources/${sourceId}/events?limit=${limit}`);
+export async function getBackendSourceEvents(
+  sourceId: string,
+  limit = 50,
+): Promise<{ total: number; events: BackendNormalizedEvent[] }> {
+  return backendFetch<{ total: number; events: BackendNormalizedEvent[] }>(
+    `/sources/${encodeURIComponent(sourceId)}/events?limit=${limit}`,
+  );
 }
 
-export async function listBackendDlq(limit = 200): Promise<{ total: number; records: BackendDlqRecord[] }> {
-  return backendFetch<{ total: number; records: BackendDlqRecord[] }>(`/dlq?limit=${limit}`);
+export interface BackendEventStreamHandlers {
+  onEvent: (event: BackendNormalizedEvent) => void;
+  onOpen?: () => void;
+  onError?: () => void;
+  onReset?: () => void;
 }
 
-export async function getBackendDashboard(limit = 5): Promise<BackendDashboard> {
+export function subscribeToBackendEvents(
+  sourceId: string | undefined,
+  handlers: BackendEventStreamHandlers,
+): () => void {
+  if (typeof window === "undefined" || typeof EventSource === "undefined")
+    return () => {};
+
+  const query = sourceId ? `?source_id=${encodeURIComponent(sourceId)}` : "";
+  const stream = new EventSource(`/backend/events/stream${query}`);
+  const handleMessage = (event: Event) => {
+    try {
+      const payload = JSON.parse(
+        (event as MessageEvent<string>).data,
+      ) as BackendNormalizedEvent;
+      if (
+        payload &&
+        typeof payload === "object" &&
+        typeof payload.event_id === "string"
+      ) {
+        handlers.onEvent(payload);
+      }
+    } catch {
+      handlers.onError?.();
+    }
+  };
+
+  const handleReset = () => handlers.onReset?.();
+  stream.addEventListener("normalized", handleMessage);
+  stream.addEventListener("reset", handleReset);
+  stream.onopen = () => handlers.onOpen?.();
+  stream.onerror = () => handlers.onError?.();
+
+  return () => {
+    stream.removeEventListener("normalized", handleMessage);
+    stream.removeEventListener("reset", handleReset);
+    stream.close();
+  };
+}
+
+export function mergeBackendEvents(
+  current: BackendNormalizedEvent[],
+  incoming: BackendNormalizedEvent[],
+  limit = 50,
+): BackendNormalizedEvent[] {
+  const byId = new Map<string, BackendNormalizedEvent>();
+  for (const event of [...current, ...incoming]) {
+    if (event.event_id) byId.set(event.event_id, event);
+  }
+  return [...byId.values()]
+    .sort((left, right) => backendEventTime(right) - backendEventTime(left))
+    .slice(0, limit);
+}
+
+function backendEventTime(event: BackendNormalizedEvent): number {
+  return typeof event.time === "number"
+    ? event.time
+    : Date.parse(event.time) || 0;
+}
+
+export async function listBackendDlq(
+  limit = 200,
+): Promise<{ total: number; records: BackendDlqRecord[] }> {
+  return backendFetch<{ total: number; records: BackendDlqRecord[] }>(
+    `/dlq?limit=${limit}`,
+  );
+}
+
+export async function getBackendStats(): Promise<BackendStats> {
+  return backendFetch<BackendStats>("/stats");
+}
+
+/**
+ * Tell the API that the indices have been wiped.
+ *
+ * Deleting the documents is not enough: the API also holds an SSE replay
+ * buffer and a resolved-field cache, and both survive an index delete. Left
+ * alone they re-serve pre-wipe data, so the board reads non-zero moments
+ * after it was reset to zero.
+ */
+export async function resetBackendStats(): Promise<void> {
+  await backendFetch<unknown>("/stats/reset", { method: "POST" });
+}
+
+/** Remove one quarantined record. The Bronze raw event is left in place. */
+export async function deleteBackendDlqRecord(dlqId: string): Promise<void> {
+  await backendFetch<{ deleted: string }>(`/dlq/${encodeURIComponent(dlqId)}`, {
+    method: "DELETE",
+  });
+}
+
+/** Empty the DLQ index outright. */
+export async function purgeBackendDlq(): Promise<{ deleted: number }> {
+  return backendFetch<{ deleted: number }>("/dlq", { method: "DELETE" });
+}
+
+// ---------------------------------------------------------------------------
+// Module 3: reprocessing
+//
+// The browser never parses. It asks the API to republish the original Bronze
+// event onto logs.raw, then polls for the orchestrator's verdict. Every
+// "recovered" claim below therefore comes from the pipeline, not from a
+// re-run of the local normalizer.
+// ---------------------------------------------------------------------------
+
+export type ReprocessStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "partial"
+  | "failed";
+
+export interface ReprocessRunError {
+  dlq_id: string;
+  detail: string;
+}
+
+/** Mirrors ReprocessRun / serialize_run() on the Python side. */
+export interface ReprocessRun {
+  reprocess_id: string;
+  status: ReprocessStatus;
+  requested_count: number;
+  published_count: number;
+  recovered_count: number;
+  failed_count: number;
+  reason?: string | null;
+  dlq_ids: string[];
+  event_ids: string[];
+  errors: ReprocessRunError[];
+  created_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  /** Only on the response of POST /dlq/{id}/reprocess. */
+  dlq_id?: string;
+}
+
+export interface DryRunPreview {
+  dlq_id: string;
+  dry_run: true;
+  would_succeed: boolean;
+  /**
+   * True when the verdict depends on the orchestrator's live Drain3 miner,
+   * which this process cannot see. A real replay may still recover it, so a
+   * false here is NOT a death sentence.
+   */
+  drain3_dependent?: boolean;
+  note?: string | null;
+  parsers_attempted?: string[];
+  previous_parsers_attempted?: string[];
+  normalized_preview?: unknown;
+  error?: string;
+}
+
+export interface BatchDryRunResult {
+  dry_run: true;
+  requested: number;
+  would_succeed: number;
+  drain3_dependent: number;
+  results: DryRunPreview[];
+}
+
+const TERMINAL_STATUSES: ReadonlySet<ReprocessStatus> = new Set([
+  "completed",
+  "partial",
+  "failed",
+]);
+
+export function isReprocessTerminal(status: ReprocessStatus): boolean {
+  return TERMINAL_STATUSES.has(status);
+}
+
+/**
+ * Ids are always explicit. The API deliberately has no "reprocess everything
+ * matching a filter" mode, and the UI must not reintroduce one: a bulk replay
+ * that silently picks its own targets is unreviewable.
+ */
+export async function reprocessDlqBatch(
+  dlqIds: string[],
+  reason?: string,
+): Promise<ReprocessRun> {
+  return backendFetch<ReprocessRun>(
+    "/dlq/reprocess",
+    jsonInit("POST", { dlq_ids: dlqIds, reason: reason ?? null }),
+  );
+}
+
+export async function reprocessDlqRecord(
+  dlqId: string,
+  reason?: string,
+): Promise<ReprocessRun> {
+  return backendFetch<ReprocessRun>(
+    `/dlq/${encodeURIComponent(dlqId)}/reprocess`,
+    jsonInit("POST", { reason: reason ?? null }),
+  );
+}
+
+/**
+ * Preview a replay without publishing anything, so a batch decision can be
+ * made on evidence rather than hope.
+ */
+export async function previewReprocessBatch(
+  dlqIds: string[],
+): Promise<BatchDryRunResult> {
+  return backendFetch<BatchDryRunResult>(
+    "/dlq/reprocess?dry_run=true",
+    jsonInit("POST", { dlq_ids: dlqIds, reason: null, dry_run: true }),
+  );
+}
+
+export async function getReprocessRun(
+  reprocessId: string,
+): Promise<ReprocessRun> {
+  return backendFetch<ReprocessRun>(
+    `/reprocess/${encodeURIComponent(reprocessId)}`,
+  );
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    function onAbort() {
+      clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+export interface PollReprocessOptions {
+  signal?: AbortSignal;
+  intervalMs?: number;
+  timeoutMs?: number;
+  onUpdate?: (run: ReprocessRun) => void;
+}
+
+/**
+ * Follow a run to a terminal status.
+ *
+ * Returns the last observed run on timeout rather than throwing, so a stuck
+ * run still shows the operator its real counters instead of an error. Only
+ * "completed", "partial" and "failed" are terminal -- a run stays "running"
+ * until the orchestrator has tallied an outcome for every published event, so
+ * polling must not stop early or it will report 0 recovered for a run that is
+ * about to succeed.
+ */
+export async function pollReprocessRun(
+  reprocessId: string,
+  opts: PollReprocessOptions = {},
+): Promise<ReprocessRun> {
+  const { signal, intervalMs = 1500, timeoutMs = 120_000, onUpdate } = opts;
+  const deadline = Date.now() + timeoutMs;
+  let run = await getReprocessRun(reprocessId);
+  onUpdate?.(run);
+  while (!isReprocessTerminal(run.status)) {
+    if (Date.now() >= deadline) return run;
+    await sleep(intervalMs, signal);
+    run = await getReprocessRun(reprocessId);
+    onUpdate?.(run);
+  }
+  return run;
+}
+
+export async function getBackendDashboard(
+  limit = 5,
+): Promise<BackendDashboard> {
   return backendFetch<BackendDashboard>(`/dashboard?limit=${limit}`);
 }
 
@@ -178,8 +670,13 @@ export interface DrainCluster {
   examples: string[];
 }
 
-export async function clusterDrainLogs(content: string): Promise<DrainCluster[]> {
-  const data = await backendFetch<{ clusters: DrainCluster[] }>("/drain/cluster", jsonInit("POST", { content }));
+export async function clusterDrainLogs(
+  content: string,
+): Promise<DrainCluster[]> {
+  const data = await backendFetch<{ clusters: DrainCluster[] }>(
+    "/drain/cluster",
+    jsonInit("POST", { content }),
+  );
   return data.clusters ?? [];
 }
 
@@ -201,20 +698,24 @@ const TRANSPORT_TO_UI: Record<string, SourceTransportId> = {
   udp: "syslog_udp",
   http: "http_collect",
   file: "file_agent",
+  sse: "sse_stream",
   other: "custom_api",
+  kafka_sim: "kafka_sim",
 };
 
 const TRANSPORT_ENDPOINT: Record<string, string> = {
-  udp: "514",
-  http: "/api/normalize",
+  udp: "1514/udp",
+  http: "http://localhost:8081/logs",
   file: "/var/lib/ulpf/uploads",
-  other: "/api/normalize",
+  sse: "https://<upstream-host>/events",
+  other: "http://localhost:8081/logs",
 };
 
 const DEFAULT_CHAIN: Record<string, string[]> = {
   syslog_udp: ["Syslog Parser", "Key/Value Parser", "Text Parser"],
   syslog_tcp: ["Syslog Parser", "Key/Value Parser", "Text Parser"],
   http_collect: ["JSON Parser", "Key/Value Parser", "Text Parser"],
+  sse_stream: ["JSON Parser", "Key/Value Parser", "Text Parser"],
   file_agent: ["Format auto-detect", "Primary chain · set on first import"],
   custom_api: ["JSON Parser", "Key/Value Parser", "Text Parser"],
 };
@@ -249,18 +750,32 @@ export function backendSourceToUi(doc: BackendSourceDoc): Source {
 // Backend → UI event adapters
 // ---------------------------------------------------------------------------
 
-export const SEVERITY_IDS: Record<string, number> = { low: 2, medium: 3, high: 4, critical: 5 };
-
-const CLASS_TABLE: Record<string, { class_uid: number; category_uid: number }> = {
-  system_activity: { class_uid: 1007, category_uid: 1 },
-  security_activity: { class_uid: 2002, category_uid: 2 },
-  application_activity: { class_uid: 6001, category_uid: 6 },
+export const SEVERITY_IDS: Record<string, number> = {
+  low: 2,
+  medium: 3,
+  high: 4,
+  critical: 5,
 };
 
-const SEVERITY_DISPLAY: Record<string, string> = { low: "low", medium: "medium", high: "high", critical: "critical" };
+const CLASS_TABLE: Record<string, { class_uid: number; category_uid: number }> =
+  {
+    system_activity: { class_uid: 1007, category_uid: 1 },
+    security_activity: { class_uid: 2002, category_uid: 2 },
+    application_activity: { class_uid: 6001, category_uid: 6 },
+  };
+
+const SEVERITY_DISPLAY: Record<string, string> = {
+  low: "low",
+  medium: "medium",
+  high: "high",
+  critical: "critical",
+};
 
 export function backendEventToOcsf(be: BackendNormalizedEvent): OcsfEvent {
-  const cls = CLASS_TABLE[be.class_name ?? ""] ?? { class_uid: 0, category_uid: 0 };
+  const cls = CLASS_TABLE[be.class_name ?? ""] ?? {
+    class_uid: 0,
+    category_uid: 0,
+  };
   const severityRaw = (be.severity ?? "").toLowerCase();
   const severityId = SEVERITY_IDS[severityRaw] ?? 0;
   const time = typeof be.time === "string" ? Date.parse(be.time) : be.time;
@@ -281,13 +796,17 @@ export function backendEventToOcsf(be: BackendNormalizedEvent): OcsfEvent {
     severity_id: severityId,
     severity: severityRaw ? SEVERITY_DISPLAY[severityRaw] : undefined,
     status_id: undefined,
-    message: be.app_id ? `${be.app_id}${be.user ? ` · ${be.user}` : ""}${be.action ? ` · ${be.action}` : ""}` : undefined,
+    message: be.app_id
+      ? `${be.app_id}${be.user ? ` · ${be.user}` : ""}${be.action ? ` · ${be.action}` : ""}`
+      : undefined,
     src_endpoint: src,
     dst_endpoint: dst,
     user: be.user ? { name: be.user } : undefined,
     device: be.device_id ? { hostname: be.device_id } : undefined,
     app_name: be.app_id ?? undefined,
-    connection_info: be.protocol_name ? { protocol_name: be.protocol_name } : undefined,
+    connection_info: be.protocol_name
+      ? { protocol_name: be.protocol_name }
+      : undefined,
     raw_data: undefined,
     metadata: { version: "1.3.0" },
     extensions: {
@@ -301,13 +820,16 @@ export function backendEventToOcsf(be: BackendNormalizedEvent): OcsfEvent {
   };
 }
 
-export function backendEventToLineResult(be: BackendNormalizedEvent, index: number): NormalizedEventResult {
+export function backendEventToLineResult(
+  be: BackendNormalizedEvent,
+  index: number,
+): NormalizedEventResult {
   return {
     ok: true,
     event: backendEventToOcsf(be),
     source_line: "",
     line_number: index + 1,
-    format: be.extensions?.format_hint as string | undefined ?? "unknown",
+    format: (be.extensions?.format_hint as string | undefined) ?? "unknown",
     parser: be.parser_id,
     parser_chain: [be.parser_tier],
     chain_rescued: be.parser_tier === "fallback",
@@ -315,12 +837,25 @@ export function backendEventToLineResult(be: BackendNormalizedEvent, index: numb
   };
 }
 
-export function backendDlqToRejected(rec: BackendDlqRecord, index: number): RejectedEventResult {
+export function backendEventSourceId(
+  event: BackendNormalizedEvent,
+): string | undefined {
+  const value = event.extensions?.source_id;
+  return value === undefined || value === null ? undefined : String(value);
+}
+
+export function backendDlqToRejected(
+  rec: BackendDlqRecord,
+  index: number,
+): RejectedEventResult {
   return {
     ok: false,
     reason: rec.classification ?? rec.status,
     line: rec.raw_payload ?? null,
     line_number: index + 1,
     tried_parsers: rec.parsers_attempted ?? [],
+    // Carries the real identity through the shared display shape so a
+    // reprocess request addresses the record, not its row index.
+    dlq_id: rec.dlq_id,
   };
 }

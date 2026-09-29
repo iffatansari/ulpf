@@ -1,35 +1,28 @@
-import { useRef, useState } from "react";
-import { useMemo } from "react";
 import { Link } from "react-router-dom";
-import { ArrowRight, BadgeCheck, Ban, Check, CheckCircle2, Copy, FileText, Info, Layers, PlayCircle, PlugZap, Radar, ShieldCheck } from "lucide-react";
+import {
+  ArrowRight,
+  BadgeCheck,
+  Ban,
+  CheckCircle2,
+  FileCode2,
+  FileText,
+  Info,
+  Layers,
+  LifeBuoy,
+  PlayCircle,
+  PlugZap,
+  Radar,
+  ShieldCheck,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { toast } from "sonner";
-import NormalizerForm from "@/components/normalizer/NormalizerForm";
-import EventTable from "@/components/events/EventTable";
 import { PageHeader, StatChip } from "@/components/common/bits";
-import { isEvent } from "@/lib/guards";
 import { useNormalizer } from "@/lib/normalize-context";
+import { formatFeedMetric, useNormalizedFeed } from "@/lib/normalized-feed";
 import { ACCENT } from "@/lib/accents";
 
 export default function Dashboard() {
-  const { result, loading, ranAt, runSample } = useNormalizer();
-  const [selectedIndex, setSelectedIndex] = useState(0);
-  const [copied, setCopied] = useState(false);
-  const resultsRef = useRef<HTMLDivElement>(null);
-
-  const events = useMemo(() => (result ? result.lines.filter(isEvent) : []), [result]);
-  const summary = result?.summary;
-
-  const copyAll = async () => {
-    if (events.length === 0) return;
-    try {
-      await navigator.clipboard.writeText(JSON.stringify(events.map((l) => l.event), null, 2));
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch {
-      toast.error("Clipboard unavailable — copy from the JSON viewer instead");
-    }
-  };
+  const { loading, ranAt, runSample } = useNormalizer();
+  const { summary } = useNormalizedFeed();
 
   return (
     <>
@@ -65,12 +58,11 @@ export default function Dashboard() {
                 size="sm"
                 variant="outline"
                 className="border-[#25263A]/25 bg-white/60 text-[#25263A] backdrop-blur hover:bg-white"
-                onClick={async () => {
-                  if (await runSample()) resultsRef.current?.scrollIntoView({ behavior: "smooth" });
-                }}
+                onClick={() => void runSample()}
+                disabled={loading}
               >
                 <PlayCircle className="h-3.5 w-3.5" />
-                Run sample
+                {loading ? "Running…" : "Run sample"}
               </Button>
             </div>
           </div>
@@ -91,67 +83,78 @@ export default function Dashboard() {
         </div>
       </section>
 
-      <div className="mt-5 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
-        <StatChip icon={FileText} label="Input lines" value={summary?.total_lines ?? 0} color={ACCENT.gray} tone={summary?.total_lines ? "text-[#25263A]" : "text-[#A6AABF]"} />
-        <StatChip icon={CheckCircle2} label="Events" value={summary?.events ?? 0} color="#2f8ce0" tone={summary?.events ? "text-emerald-600" : "text-[#A6AABF]"} />
-        <StatChip icon={Ban} label="Rejected" value={summary?.rejected ?? 0} color="#e11d48" tone={summary?.rejected ? "text-rose-600" : "text-[#A6AABF]"} />
-        <StatChip icon={Info} label="Skipped" value={summary?.skipped ?? 0} color="#d97706" tone={summary?.skipped ? "text-amber-600" : "text-[#A6AABF]"} />
-        <StatChip icon={Layers} label="Classes" value={summary ? Object.keys(summary.by_class).length : 0} color="#7c4dcc" tone={summary ? "text-[#25263A]" : "text-[#A6AABF]"} />
+      <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 className="text-base font-bold tracking-tight">Normalization summary</h2>
+          <p className="mt-0.5 text-sm text-muted-foreground">
+            These are the same counters the Events, Metrics, Sources and DLQ pages
+            render — one aggregate, one number each.
+          </p>
+        </div>
+        <Button asChild variant="outline" size="sm">
+          <Link to="/events/normalized">
+            Open events <ArrowRight className="h-3.5 w-3.5" />
+          </Link>
+        </Button>
       </div>
 
-      <div className="mt-6 grid gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
-        <div>
-          <h2 className="mb-2 text-base font-bold tracking-tight">Quick normalize</h2>
-          <NormalizerForm compact onDone={() => resultsRef.current?.scrollIntoView({ behavior: "smooth" })} />
-        </div>
-        <div ref={resultsRef} className="min-w-0 scroll-mt-20">
-          <div className="mb-2 flex items-center justify-between gap-2">
-            <h2 className="text-base font-bold tracking-tight">
-              Normalized events
-              {result && <span className="ml-1 text-sm font-normal text-muted-foreground">({events.length})</span>}
-            </h2>
-            <div className="flex items-center gap-2">
-              <Button variant="outline" size="sm" onClick={copyAll} disabled={events.length === 0} title="Copy all normalized events as OCSF JSON">
-                {copied ? <Check className="h-3.5 w-3.5 text-emerald-500" /> : <Copy className="h-3.5 w-3.5" />}
-                {copied ? "Copied" : "Copy JSON"}
-              </Button>
-              <Button asChild variant="outline" size="sm">
-                <Link to="/events/normalized">
-                  Open events <ArrowRight className="h-3.5 w-3.5" />
-                </Link>
-              </Button>
-            </div>
-          </div>
-          {events.length > 0 ? (
-            <>
-              <EventTable events={events} selectedIndex={selectedIndex} onSelect={setSelectedIndex} heightClass="max-h-[480px]" emptyMessage="No events match." />
-              {ranAt && <p className="mt-2 font-mono text-[10px] text-muted-foreground">last run · {new Date(ranAt).toLocaleString()}</p>}
-            </>
-          ) : result ? (
-            <div className="flex flex-col items-start gap-3 rounded-xl border border-dashed border-border bg-card/60 px-5 py-8">
-              <span className="flex h-10 w-10 items-center justify-center rounded-xl text-white" style={{ backgroundColor: "#e11d48", boxShadow: "0 10px 20px -10px #e11d48" }}>
-                <Ban className="h-4.5 w-4.5" />
-              </span>
-              <p className="text-sm text-muted-foreground">This ingestion produced no normalized events — every line was rejected. Check the DLQ for the rejected lines.</p>
-              <Button asChild size="sm">
-                <Link to="/events/dlq">
-                  Open DLQ <ArrowRight className="h-3.5 w-3.5" />
-                </Link>
-              </Button>
-            </div>
-          ) : (
-            <div className="flex flex-col items-start gap-3 rounded-xl border border-dashed border-border bg-card/60 px-5 py-8">
-              <span className="flex h-10 w-10 items-center justify-center rounded-xl text-white" style={{ backgroundColor: ACCENT.blue, boxShadow: `0 10px 20px -10px ${ACCENT.blue}` }}>
-                <Info className="h-4.5 w-4.5" />
-              </span>
-              <p className="text-sm text-muted-foreground">No ingestion yet. Run the sample bundle or use the quick normalizer to populate the whole workspace.</p>
-              <Button size="sm" onClick={() => runSample()} disabled={loading} className="bg-gradient-to-r from-[#2f8ce0] to-[#7c4dcc] text-white shadow-lg shadow-[#2f8ce0]/25">
-                {loading ? "Running…" : "Run sample bundle"}
-              </Button>
-            </div>
-          )}
-        </div>
+      <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
+        <StatChip
+          icon={FileText}
+          label="Input lines"
+          value={formatFeedMetric(summary.totalLines)}
+          color={ACCENT.gray}
+          tone={summary.totalLines ? "text-[#25263A]" : "text-[#A6AABF]"}
+        />
+        <StatChip
+          icon={CheckCircle2}
+          label="Events normalized"
+          value={summary.events}
+          color="#2f8ce0"
+          tone={summary.events ? "text-emerald-600" : "text-[#A6AABF]"}
+        />
+        <StatChip
+          icon={Ban}
+          label="Rejected"
+          value={summary.rejected}
+          color="#e11d48"
+          tone={summary.rejected ? "text-rose-600" : "text-[#A6AABF]"}
+        />
+        <StatChip
+          icon={Info}
+          label="Skipped"
+          value={formatFeedMetric(summary.skipped)}
+          color="#d97706"
+          tone={summary.skipped ? "text-amber-600" : "text-[#A6AABF]"}
+        />
+        <StatChip
+          icon={LifeBuoy}
+          label="Rescued"
+          value={formatFeedMetric(summary.rescued)}
+          color="#7c4dcc"
+          tone={summary.rescued ? "text-[#25263A]" : "text-[#A6AABF]"}
+        />
+        <StatChip
+          icon={Layers}
+          label="Classes"
+          value={summary.classes}
+          color="#7c4dcc"
+          tone={summary.classes ? "text-[#25263A]" : "text-[#A6AABF]"}
+        />
+        <StatChip
+          icon={FileCode2}
+          label="Formats"
+          value={summary.formats}
+          color="#0f766e"
+          tone={summary.formats ? "text-[#25263A]" : "text-[#A6AABF]"}
+        />
       </div>
+
+      {ranAt && (
+        <p className="mt-3 font-mono text-[10px] text-muted-foreground">
+          last run · {new Date(ranAt).toLocaleString()}
+        </p>
+      )}
     </>
   );
 }

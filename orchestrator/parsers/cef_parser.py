@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from schema.normalized_event import NormalizedEvent
+from parsers.severity import severity_from_cef_number, severity_from_text
 
 
 def parse_cef_log(
@@ -41,21 +42,11 @@ def parse_cef_log(
         if not cef_version.startswith("CEF:"):
             return None
 
-        # Convert CEF severity into our normalized severity.
-        try:
-            severity_number = int(severity_raw)
-
-            if severity_number >= 8:
-                severity = "critical"
-            elif severity_number >= 5:
-                severity = "high"
-            elif severity_number >= 3:
-                severity = "medium"
-            else:
-                severity = "low"
-
-        except ValueError:
-            severity = "medium"
+        # CEF severity is normally 0-10 (higher is worse); some vendors send a
+        # label instead, and anything unrecognized keeps the medium default.
+        severity = severity_from_cef_number(severity_raw)
+        if severity is None:
+            severity = severity_from_text(severity_raw) or "medium"
 
         # Parse CEF extension key=value pairs.
         extensions = {}

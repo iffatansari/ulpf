@@ -14,6 +14,7 @@ from db import (
     UPLOADS_INDEX,
     get_opensearch_client,
     get_source,
+    resolve_field,
 )
 
 
@@ -31,7 +32,7 @@ class SourceCreate(BaseModel):
         "iot",
         "custom",
     ] = Field(...)
-    transport: Literal["udp", "http", "file", "other"] = Field(...)
+    transport: Literal["udp", "http", "file", "sse", "other", "kafka_sim"] = Field(...)
     expected_format: Literal["auto", "mixed", "syslog", "json", "cef"] = Field(
         default="mixed"
     )
@@ -96,7 +97,7 @@ def list_sources():
 def create_source(source: SourceCreate):
     """
     Register one log source in the Source Registry (ulpf-sources).
-    Transport is one of: udp, http, file, other.
+    Transport is one of: udp, http, file, sse, other.
     """
     source_id = make_source_id(source.name)
     document = to_source_doc(source_id, source.model_dump())
@@ -187,60 +188,65 @@ def source_stats(source_id: str):
       format distribution → Bronze format_hint
       parser distribution → Silver parser_id
       blank / errored lines → summed from ulpf-uploads jobs
+
+    Every field name goes through `resolve_field` rather than a hardcoded
+    ".keyword". Silver and DLQ are dynamically mapped, so a source id can
+    be a real keyword in one index and text-with-a-keyword-subfield in
+    another. The wrong name does not error -- it returns zero, which is
+    how this endpoint previously reported "0 events" for a source that the
+    dashboard, reading the same Silver index without a filter, said had
+    hundreds.
     """
     es = get_opensearch_client()
 
     if get_source(source_id) is None:
         raise HTTPException(status_code=404, detail=f"source not found: {source_id}")
 
-    raw = es.count(
-        index=BRONZE_INDEX,
-        body={"query": {"term": {"source_id": source_id}}},
-    )["count"]
+    def count_in(index: str, path: str) -> int:
+        field = resolve_field(index, path)
+        if not field:
+            return 0
+        return es.count(
+            index=index,
+            body={"query": {"term": {field: source_id}}},
+        )["count"]
 
-    normalized = es.count(
-        index=SILVER_INDEX,
-        body={"query": {"term": {"extensions.source_id.keyword": source_id}}},
-    )["count"]
+    def terms_in(index: str, path: str) -> dict:
+        field = resolve_field(index, path)
+        if not field:
+            return {}
+        resp = es.search(
+            index=index,
+            body={
+                "size": 0,
+                "query": {"term": {field: source_id}},
+                "aggs": {"buckets": {"terms": {"field": field, "size": 20}}},
+            },
+        )
+        return {
+            b["key"] or "none": b["doc_count"]
+            for b in resp["aggregations"]["buckets"]["buckets"]
+        }
 
-    dlq = es.count(
-        index=DLQ_INDEX,
-        body={"query": {"term": {"metadata.source_id.keyword": source_id}}},
-    )["count"]
+    raw = count_in(BRONZE_INDEX, "source_id")
+    normalized = count_in(SILVER_INDEX, "extensions.source_id")
+    dlq = count_in(DLQ_INDEX, "metadata.source_id")
 
-    formats_agg = es.search(
-        index=BRONZE_INDEX,
-        body={
-            "size": 0,
-            "query": {"term": {"source_id": source_id}},
-            "aggs": {"formats": {"terms": {"field": "format_hint", "size": 20}}},
-        },
-    )
-    formats = {
-        b["key"] or "none": b["doc_count"] for b in formats_agg["aggregations"]["formats"]["buckets"]
-    }
+    formats = terms_in(BRONZE_INDEX, "format_hint")
+    parsers = terms_in(SILVER_INDEX, "parser_id")
 
-    parsers_agg = es.search(
-        index=SILVER_INDEX,
-        body={
-            "size": 0,
-            "query": {"term": {"extensions.source_id.keyword": source_id}},
-            "aggs": {"parsers": {"terms": {"field": "parser_id.keyword", "size": 20}}},
-        },
-    )
-    parsers = {
-        b["key"] or "none": b["doc_count"] for b in parsers_agg["aggregations"]["parsers"]["buckets"]
-    }
-
-    last_agg = es.search(
-        index=BRONZE_INDEX,
-        body={
-            "size": 0,
-            "query": {"term": {"source_id": source_id}},
-            "aggs": {"last": {"max": {"field": "ingested_at"}}},
-        },
-    )
-    last_ingested = last_agg["aggregations"]["last"].get("value_as_string")
+    ingested_field = resolve_field(BRONZE_INDEX, "ingested_at")
+    last_ingested = None
+    if ingested_field:
+        last_agg = es.search(
+            index=BRONZE_INDEX,
+            body={
+                "size": 0,
+                "query": {"term": {resolve_field(BRONZE_INDEX, "source_id"): source_id}},
+                "aggs": {"last": {"max": {"field": ingested_field}}},
+            },
+        )
+        last_ingested = last_agg["aggregations"]["last"].get("value_as_string")
 
     uploads_agg = es.search(
         index=UPLOADS_INDEX,

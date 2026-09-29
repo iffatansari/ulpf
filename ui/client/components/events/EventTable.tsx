@@ -9,8 +9,9 @@ import { cn } from "@/lib/utils";
 
 interface Props {
   events: NormalizedEventResult[];
-  selectedIndex: number;
-  onSelect: (index: number) => void;
+  /** Omit both when the table is read-only (no detail panel to select into). */
+  selectedIndex?: number;
+  onSelect?: (index: number) => void;
   heightClass?: string;
   showFilter?: boolean;
   emptyMessage?: string;
@@ -62,15 +63,19 @@ export default function EventTable({ events, selectedIndex, onSelect, heightClas
             const dst = ev.dst_endpoint?.ip;
             const apiOp = ev.api?.operation ?? (ev.http_request?.url?.path ? `${ev.http_request.method ?? ""} ${ev.http_request.url.path}`.trim() : undefined);
             const tone = categoryTone(ev.category_uid);
+            const isSelected = selectedIndex === idx;
             return (
               <button
                 key={`${l.line_number}-${ev.class_uid}`}
-                onClick={() => onSelect(idx)}
+                type="button"
+                onClick={onSelect ? () => onSelect(idx) : undefined}
+                aria-pressed={onSelect ? isSelected : undefined}
                 className={cn(
-                  "block w-full border-l-2 px-3 py-2.5 text-left transition-colors hover:bg-accent/60",
-                  selectedIndex === idx ? "bg-accent/70" : "border-transparent",
+                  "block w-full border-l-2 px-3 py-2.5 text-left transition-colors",
+                  onSelect && "hover:bg-accent/60",
+                  isSelected ? "bg-accent/70" : "border-transparent",
                 )}
-                style={selectedIndex === idx ? { borderLeftColor: tone.strong } : undefined}
+                style={isSelected ? { borderLeftColor: tone.strong } : undefined}
               >
                 <div className="flex items-center gap-2">
                   <span className="w-10 shrink-0 font-mono text-[10px] text-muted-foreground">#{l.line_number}</span>
