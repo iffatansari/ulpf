@@ -1,4 +1,6 @@
 import os
+from typing import Optional
+
 from opensearchpy import OpenSearch
 
 _OPENSEARCH_CLIENT = None
@@ -183,6 +185,64 @@ def ensure_indices(es: OpenSearch = None, indices: list = None):
         body = INDEX_BODIES.get(name, {})
         es.indices.create(index=name, body=body)
         print(f"Created OpenSearch index {name}", flush=True)
+
+
+_FIELD_CACHE: dict = {}
+
+
+def clear_field_cache() -> None:
+    """
+    Forget resolved field names.
+
+    Silver and DLQ are dynamically mapped: a field only exists once a
+    document has used it, and `_source_id` can be a real `keyword` in one
+    index and text-with-a-keyword-subfield in another. A cached resolution
+    therefore goes stale the first time a mapping changes, which is exactly
+    what a run that wipes the indices does.
+    """
+    _FIELD_CACHE.clear()
+
+
+def resolve_field(index: str, path: str) -> Optional[str]:
+    """
+    Resolve a dotted field path to the name OpenSearch can actually query.
+
+    Returns the path unchanged when it is already a keyword/numeric/date
+    field, `<path>.keyword` when it is text with a keyword subfield, and
+    None when the field is not in the mapping at all.
+
+    Hardcoding ".keyword" is right for one index and silently wrong for the
+    other, and a wrong field name returns an empty result set -- which reads
+    as "no records arrived" and sends you hunting a pipeline bug that does
+    not exist. Asking the live mapping is the only way to tell the two apart.
+    """
+    key = (index, path)
+    if key in _FIELD_CACHE:
+        return _FIELD_CACHE[key]
+
+    resolved: Optional[str] = None
+    es = get_opensearch_client()
+    try:
+        mapping = es.indices.get_mapping(index=index)
+        properties = mapping[index]["mappings"].get("properties", {})
+        node = None
+        current = properties
+        for part in path.split("."):
+            if not isinstance(current, dict) or part not in current:
+                node = None
+                break
+            node = current[part]
+            current = node.get("properties") if isinstance(node, dict) else None
+        if isinstance(node, dict):
+            if node.get("type") == "text" and "keyword" in (node.get("fields") or {}):
+                resolved = f"{path}.keyword"
+            else:
+                resolved = path
+    except Exception:
+        resolved = None
+
+    _FIELD_CACHE[key] = resolved
+    return resolved
 
 
 def get_source(source_id: str):

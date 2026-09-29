@@ -674,7 +674,7 @@ export function collectorSnippet(
       const resolved = source.id === "draft" ? "<source-id-assigned-after-create>" : source.id;
       return [
         `# generate a continuous synthetic stream into the raw topic`,
-        `python demo/kafka_live_producer.py --source-id ${resolved} --rate 2`,
+        `python demo/kafka_live_producer.py --source-id ${resolved} --rate 0.5`,
         ``,
         `# preview without a broker, then Ctrl-C to stop`,
         `python demo/kafka_live_producer.py --source-id ${resolved} --dry-run --count 8`,

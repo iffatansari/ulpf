@@ -7,7 +7,8 @@ UI as a live stream. Payload formats rotate: syslog, CEF, JSON, and free-form
 prose that only the drain3 fallback tier can handle. All four land in Silver,
 so the default stream is DLQ-free and every record is normalized.
 
-`malformed_json` is opt-in for when you deliberately want DLQ traffic:
+`malformed_json` breaks its own parser on purpose, to exercise the declared
+format falling through to the drain3 tier:
     python demo/kafka_live_producer.py --format syslog,cef,json,malformed_json
 
 The record envelope and the format hint come from the same production code the
@@ -21,12 +22,19 @@ Run against the compose broker (Redpanda is exposed on localhost:9092):
 Preview without a broker (generates and normalizes, prints, sends nothing):
     python demo/kafka_live_producer.py --dry-run --count 8
 
-Note on the DLQ: the default mix never reaches it, by design. Free text does
-not reach it either, as long as drain3 can mine a recognizable identity out of
-it (`src=`, `user=`, a bare MAC or IPv4) -- the orchestrator probes
-cef/json/syslog, then falls back to drain3-fallback-v1 and stores the result in
-Silver at severity low. To land in the DLQ a record needs a known format_hint
-whose own parser fails, which is what the opt-in malformed_json generator does.
+Note on the DLQ: no generator here reaches it, and none can. The orchestrator
+probes the hinted parser (cef/json/syslog) and then falls through to
+drain3-fallback-v1, so a broken declared format is only rejected when drain3
+also comes up empty. Every generator below, malformed_json included, still
+carries the `host=`/`user=` tokens drain3 masks, so all of them land in Silver
+as drain3 events at severity low.
+
+The DLQ needs a payload with no recoverable identity at all, which is why no
+generator produces one: inventing contentless output here would just teach the
+demo that an unrecoverable record is normal. To see a DLQ record for real, post
+a body with no src/dst/user/mac to the HTTP collector on :8081 -- it answers
+400 and still publishes, and the orchestrator files it as
+no_recoverable_identity.
 """
 
 from __future__ import annotations
@@ -141,12 +149,27 @@ def gen_malformed_json(rng: random.Random) -> str:
     )
 
 
-# Generators whose format_hint is forced to a KNOWN format, so the single
-# matching parser is tried and then fails. That is the reliable path into the
-# DLQ: a payload no parser can mine an identity from is also rejected, but only
-# once drain3 has nothing left. Kept out of DEFAULT_FORMATS so the live stream
-# stays DLQ-free unless malformed_json is asked for by name.
-FORCED_HINTS = {"malformed_json": "json"}
+def gen_dlq_demo(rng: random.Random) -> str:
+    """
+    A JSON payload with no recoverable identity fields.
+
+    It carries a `format_hint=json` so the JSON parser is tried first. That
+    parser expects fields like host/user/action/src_ip; finding none it
+    declines. The record then falls through to drain3, which also finds no
+    src/dst/user/mac field to mask, so it returns None and the record is
+    quarantined as `no_recoverable_identity` in the DLQ. This is the only
+    generator in the producer that deliberately reaches the DLQ, and it
+    exists so a live stream can leave real quarantined records without an
+    external seeding step.
+    """
+    return json.dumps({"message": "system event logged by demo"})
+
+
+# Generators whose format_hint is forced to a KNOWN format, so the hinted parser
+# is tried and fails, and the fallthrough to drain3 is what actually lands the
+# record in Silver. This is the case that proves the fallthrough exists, not a
+# path into the DLQ. Kept out of DEFAULT_FORMATS because it is not real traffic.
+FORCED_HINTS = {"malformed_json": "json", "dlq_demo": "dlq"}
 
 
 GENERATORS = {
@@ -155,13 +178,14 @@ GENERATORS = {
     "json": gen_json,
     "unknown": gen_unknown,
     "malformed_json": gen_malformed_json,
+    "dlq_demo": gen_dlq_demo,
 }
 
 # Each of these four parses, so the default stream lands wholly in Silver.
-# `unknown` is in the mix on purpose: it is the only generator that exercises
-# the drain3-fallback-v1 tier, and it reaches Silver rather than the DLQ
-# because gen_unknown emits the src=/user= tokens drain3 masks.
-# `malformed_json` stays out -- it is the deliberate-failure opt-in.
+# `unknown` is in the mix on purpose: it is the only generator that reaches the
+# drain3-fallback-v1 tier, and it lands in Silver rather than the DLQ because
+# gen_unknown emits the src=/user= tokens drain3 masks.
+# `malformed_json` stays out -- it is the deliberate fallthrough opt-in.
 DEFAULT_FORMATS = "syslog,cef,json,unknown"
 
 

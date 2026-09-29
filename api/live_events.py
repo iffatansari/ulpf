@@ -88,6 +88,19 @@ class LiveEventHub:
                     queue.get_nowait()
             queue.put_nowait(SSE_RESET)
 
+    def clear_replay(self) -> None:
+        """
+        Drop the replay buffer.
+
+        The buffer is in-memory history of events the pipeline has already
+        published. Wiping the indices to start a run from zero does NOT
+        touch it, so a browser that reconnects with `last-event-id` gets
+        pre-wipe events replayed at it and the feed climbs back to a
+        non-zero count the dashboard then reports as truth. Clearing the
+        buffer is what makes "every counter reads zero" actually true.
+        """
+        self._replay.clear()
+
     def replay_since(
         self, last_event_id: Optional[str], source_id: Optional[str] = None
     ) -> list[dict[str, Any]]:

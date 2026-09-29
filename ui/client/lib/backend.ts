@@ -110,6 +110,50 @@ export interface BackendDashboard {
   recent_uploads: Record<string, unknown>[];
 }
 
+/**
+ * Every counter the UI renders, from one aggregate on the API.
+ *
+ * This is the only count contract the pages read. Each field is a real
+ * OpenSearch aggregation rather than something tallied in the browser from
+ * a 50-row page of events, which is what used to make the Metrics charts
+ * describe a sample of the data while the stat chip above them claimed to
+ * describe all of it.
+ */
+export interface SourcePerSourceStats {
+  source_id: string;
+  raw_events: number;
+  normalized_events: number;
+  dlq_events: number;
+  rescued: number;
+}
+
+export interface BackendStats {
+  bronze_events: number;
+  silver_events: number;
+  dlq_events: number;
+  dlq_unresolved: number;
+  dlq_recovered: number;
+  dlq_reasons: Record<string, number>;
+  /** Events normalized by drain3-fallback-v1, i.e. rescued off the DLQ path. */
+  rescued: number;
+  parsers: Record<string, number>;
+  tiers: Record<string, number>;
+  classes: Record<string, number>;
+  severities: Record<string, number>;
+  /** Aggregated over Bronze -- the detected format only exists there. */
+  formats: Record<string, number>;
+  /**
+   * One row per source_id found in the data, not per registered source.
+   * Events from an unregistered source_id still count towards
+   * `silver_events`, so a rollup keyed on the registry would be a subset
+   * of the headline number.
+   */
+  per_source: SourcePerSourceStats[];
+  uploads: number;
+  registered_sources: number;
+  reprocess_runs: number;
+}
+
 // ---------------------------------------------------------------------------
 // Low-level fetch through the /backend proxy
 // ---------------------------------------------------------------------------
@@ -407,6 +451,34 @@ export async function listBackendDlq(
   return backendFetch<{ total: number; records: BackendDlqRecord[] }>(
     `/dlq?limit=${limit}`,
   );
+}
+
+export async function getBackendStats(): Promise<BackendStats> {
+  return backendFetch<BackendStats>("/stats");
+}
+
+/**
+ * Tell the API that the indices have been wiped.
+ *
+ * Deleting the documents is not enough: the API also holds an SSE replay
+ * buffer and a resolved-field cache, and both survive an index delete. Left
+ * alone they re-serve pre-wipe data, so the board reads non-zero moments
+ * after it was reset to zero.
+ */
+export async function resetBackendStats(): Promise<void> {
+  await backendFetch<unknown>("/stats/reset", { method: "POST" });
+}
+
+/** Remove one quarantined record. The Bronze raw event is left in place. */
+export async function deleteBackendDlqRecord(dlqId: string): Promise<void> {
+  await backendFetch<{ deleted: string }>(`/dlq/${encodeURIComponent(dlqId)}`, {
+    method: "DELETE",
+  });
+}
+
+/** Empty the DLQ index outright. */
+export async function purgeBackendDlq(): Promise<{ deleted: number }> {
+  return backendFetch<{ deleted: number }>("/dlq", { method: "DELETE" });
 }
 
 // ---------------------------------------------------------------------------

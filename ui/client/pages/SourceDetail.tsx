@@ -131,6 +131,12 @@ export default function SourceDetail() {
   const accepted = stats?.normalized_events ?? source?.lastRun?.accepted ?? 0;
   const dlqCount = stats?.dlq_events ?? source?.lastRun?.rejected ?? 0;
   const linesCount = stats?.raw_events ?? source?.lastRun?.total ?? 0;
+  // Read from the parser aggregation rather than from `lastRun`. `lastRun`
+  // only exists after a browser-side sample run, so for every source fed by
+  // the live pipeline the Rescued chip showed 0 while the Sources page and
+  // Metrics counted the same drain3 events correctly.
+  const rescuedCount =
+    stats?.parsers["drain3-fallback-v1"] ?? source?.lastRun?.rescued ?? 0;
 
   if (!source || !type) {
     return (
@@ -308,9 +314,9 @@ export default function SourceDetail() {
         <StatChip
           icon={Radar}
           label="Rescued"
-          value={source.lastRun?.rescued ?? 0}
+          value={rescuedCount}
           color="#7c4dcc"
-          tone={source.lastRun?.rescued ? "text-[#25263A]" : "text-[#A6AABF]"}
+          tone={rescuedCount ? "text-[#25263A]" : "text-[#A6AABF]"}
         />
         <StatChip
           icon={Ban}

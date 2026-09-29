@@ -87,7 +87,8 @@ export default function Dashboard() {
         <div>
           <h2 className="text-base font-bold tracking-tight">Normalization summary</h2>
           <p className="mt-0.5 text-sm text-muted-foreground">
-            Counts mirror the Normalized events page — one run, one source of truth.
+            These are the same counters the Events, Metrics, Sources and DLQ pages
+            render — one aggregate, one number each.
           </p>
         </div>
         <Button asChild variant="outline" size="sm">

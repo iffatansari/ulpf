@@ -68,6 +68,52 @@ def list_dlq(limit: int = Query(50, le=500)):
     }
 
 
+@router.delete("/dlq/{dlq_id}")
+def delete_dlq_record(dlq_id: str):
+    """
+    Remove one DLQ record from the queue.
+
+    Deliberately narrow. A record in this index is the only thing standing
+    between an operator and a piece of raw evidence that a parser rejected,
+    so deleting one is a decision, not a cleanup -- hence an explicit id
+    rather than a filter, the same rule the reprocess routes follow. The
+    Bronze raw event is left untouched: deleting the DLQ record retires the
+    rejection, it does not erase the log line it refers to.
+    """
+    es = get_opensearch_client()
+    index = os.getenv("DLQ_INDEX", "ulpf-dlq")
+
+    if not es.exists(index=index, id=dlq_id):
+        raise HTTPException(status_code=404, detail=f"dlq record not found: {dlq_id}")
+
+    es.delete(index=index, id=dlq_id, refresh=True)
+    return {"deleted": dlq_id}
+
+
+@router.delete("/dlq")
+def purge_dlq():
+    """
+    Empty the whole DLQ index.
+
+    The "start from a clean board" operation: the run script uses it after
+    a reset so no leftover rejection is mistaken for one this run produced.
+    `refresh=true` matters here -- without it the delete is not visible to
+    the next `count()` and the DLQ reads non-zero for a few seconds after
+    it has already been emptied.
+    """
+    es = get_opensearch_client()
+    index = os.getenv("DLQ_INDEX", "ulpf-dlq")
+    if not es.indices.exists(index=index):
+        return {"deleted": 0, "total": 0}
+    deleted = es.delete_by_query(
+        index=index,
+        body={"query": {"match_all": {}}},
+        refresh=True,
+        conflicts="proceed",
+    )["deleted"]
+    return {"deleted": deleted, "total": 0}
+
+
 @router.get("/dlq/{dlq_id}")
 def get_dlq_record(dlq_id: str):
     """

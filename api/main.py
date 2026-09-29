@@ -21,6 +21,8 @@ from routes.reprocess import router as reprocess_router
 from routes.drain import router as drain_router
 from routes.parsers import ensure_builtin_parsers
 from routes.parsers import router as parsers_router
+from routes.stats import router as stats_router
+from routes.stats import stats as compute_stats
 
 
 CORS_ORIGINS = [
@@ -84,6 +86,7 @@ app.include_router(dlq_router)
 app.include_router(reprocess_router)
 app.include_router(drain_router)
 app.include_router(parsers_router)
+app.include_router(stats_router)
 
 
 @app.get("/")
@@ -95,14 +98,15 @@ def root():
 def dashboard(limit: int = Query(5, le=20)):
     """
     High-level dashboard numbers for the ULPF UI.
-    Every value is computed directly from OpenSearch.
+
+    The counts are read from the same aggregate `/stats` serves, rather
+    than from a second, independent set of `count()` calls. Two endpoints
+    asking OpenSearch the same question moments apart is how the Dashboard
+    and the Metrics page end up disagreeing about how many events exist:
+    each was honest, and together they were a lie.
     """
     es = get_opensearch_client()
-
-    sources = es.count(index=SOURCES_INDEX, body={})["count"]
-    normalized = es.count(index=SILVER_INDEX, body={})["count"]
-    dlq = es.count(index=DLQ_INDEX, body={})["count"]
-    uploads = es.count(index=UPLOADS_INDEX, body={})["count"]
+    totals = compute_stats()
 
     recent_events = es.search(
         index=SILVER_INDEX,
@@ -115,10 +119,10 @@ def dashboard(limit: int = Query(5, le=20)):
     )["hits"]["hits"]
 
     return {
-        "sources": sources,
-        "normalized_events": normalized,
-        "dlq_events": dlq,
-        "uploads": uploads,
+        "sources": totals["registered_sources"],
+        "normalized_events": totals["silver_events"],
+        "dlq_events": totals["dlq_events"],
+        "uploads": totals["uploads"],
         "recent_events": [h["_source"] for h in recent_events],
         "recent_uploads": enrich_upload_counts(
             [h["_source"] for h in recent_uploads]

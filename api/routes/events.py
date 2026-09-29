@@ -11,6 +11,7 @@ from db import (
     get_bronze,
     get_opensearch_client,
     get_source,
+    resolve_field,
 )
 from live_events import (
     SSE_HEARTBEAT_SECONDS,
@@ -32,17 +33,26 @@ def build_event_query(filters: dict, limit: int) -> dict:
 
     Source/severity/parser are keyword filters against the normalized
     event. Optional start/end bound the event 'time' range.
+
+    Field names are resolved against the live mapping. Silver is
+    dynamically mapped, so `extensions.source_id` may be a real keyword or
+    text-with-a-keyword-subfield depending on which document created it. A
+    hardcoded suffix that happens to be wrong returns an empty result set
+    rather than an error, which reads as "this source produced nothing" --
+    so a filter that silently matches nothing is worse than no filter.
     """
     must = []
 
     if filters.get("source_id") is not None:
-        must.append(
-            {"term": {"extensions.source_id.keyword": filters["source_id"]}}
-        )
-    if filters.get("severity"):
-        must.append({"term": {"severity.keyword": filters["severity"]}})
-    if filters.get("parser_id"):
-        must.append({"term": {"parser_id.keyword": filters["parser_id"]}})
+        field = resolve_field(SILVER_INDEX, "extensions.source_id")
+        if field:
+            must.append({"term": {field: filters["source_id"]}})
+
+    for path, key in (("severity", "severity"), ("parser_id", "parser_id")):
+        if filters.get(key):
+            field = resolve_field(SILVER_INDEX, path)
+            if field:
+                must.append({"term": {field: filters[key]}})
 
     time_range = {}
     if filters.get("start"):

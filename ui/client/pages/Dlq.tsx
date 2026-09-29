@@ -10,11 +10,14 @@ import {
   RefreshCcw,
   Search,
   Tags,
+  Trash2,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { PageHeader, StatChip } from "@/components/common/bits";
+import { useNormalizedFeed } from "@/lib/normalized-feed";
 import {
+  deleteBackendDlqRecord,
   isReprocessTerminal,
   listBackendDlq,
   pollReprocessRun,
@@ -28,6 +31,16 @@ import {
 
 const PAGE_SIZE = 200;
 const REASON_MAX = 280;
+
+/**
+ * How often this page re-reads the queue.
+ *
+ * The page used to load once on mount and then only on a manual click, so
+ * a run that wiped the DLQ left the previous run's rows on screen
+ * indefinitely -- the queue looked full while the index was empty. A short
+ * poll is what makes the page agree with every other section.
+ */
+const REFRESH_MS = 2000;
 
 type Busy = false | "single" | "batch" | "preview";
 
@@ -68,6 +81,11 @@ function isBenignReason(reason: string): boolean {
  * reaches a terminal status.
  */
 export default function Dlq() {
+  // The headline counters come from the shared /stats aggregate so they
+  // cannot disagree with the Dashboard, Metrics or Sources pages. The
+  // record list below is still fetched from /dlq, because that endpoint
+  // returns the payload and audit trail the table renders.
+  const { summary } = useNormalizedFeed();
   const [records, setRecords] = useState<BackendDlqRecord[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string[]>([]);
@@ -90,28 +108,58 @@ export default function Dlq() {
 
   useEffect(() => {
     void refresh();
-    return () => abortRef.current?.abort();
+    const tick = setInterval(() => void refresh(), REFRESH_MS);
+    const onWake = () => {
+      if (document.visibilityState === "visible") void refresh();
+    };
+    document.addEventListener("visibilitychange", onWake);
+    window.addEventListener("focus", onWake);
+    return () => {
+      clearInterval(tick);
+      document.removeEventListener("visibilitychange", onWake);
+      window.removeEventListener("focus", onWake);
+      abortRef.current?.abort();
+    };
   }, [refresh]);
+
+  // A record removed by the poll must not stay ticked: the selection would
+  // keep targeting an id that no longer exists.
+  useEffect(() => {
+    setSelected((current) => {
+      if (current.length === 0 || !records) return current;
+      const live = new Set(records.map((r) => r.dlq_id));
+      const next = current.filter((id) => live.has(id));
+      return next.length === current.length ? current : next;
+    });
+  }, [records]);
+
+  const removeRecord = useCallback(
+    async (dlqId: string) => {
+      setBusy("batch");
+      setActionError(null);
+      try {
+        await deleteBackendDlqRecord(dlqId);
+        await refresh();
+      } catch (err) {
+        setActionError(errorText(err));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [refresh],
+  );
 
   const unresolved = useMemo(
     () => (records ?? []).filter((r) => r.resolution_status !== "recovered"),
     [records],
   );
-  const recovered = useMemo(
-    () => (records ?? []).filter((r) => r.resolution_status === "recovered"),
-    [records],
-  );
-  const reasons = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const r of records ?? [])
-      counts.set(r.classification ?? r.status, (counts.get(r.classification ?? r.status) ?? 0) + 1);
-    return [...counts.entries()].sort((a, b) => b[1] - a[1]);
-  }, [records]);
 
-  // A batch is always explicit. With nothing ticked we offer the unresolved
-  // records as the suggested set, but the operator still sees and confirms the
-  // exact ids before anything is published.
+  // The batch is always explicit. With nothing ticked we offer the
+  // unresolved records we have actually loaded, and when the queue is
+  // larger than one page we say so rather than implying the button covers
+  // every record in the index.
   const targets = selected.length > 0 ? selected : unresolved.map((r) => r.dlq_id);
+  const queueTruncated = summary.rejected > (records?.length ?? 0);
 
   const startRun = useCallback(
     async (ids: string[]) => {
@@ -290,9 +338,9 @@ export default function Dlq() {
 
       {/* --------------------------------------------------------- stats */}
       <div className="mb-5 grid grid-cols-2 gap-2 sm:grid-cols-4">
-        <StatChip icon={Ban} label="Unresolved" value={unresolved.length} color="#e11d48" tone="text-rose-600" />
-        <StatChip icon={LifeBuoy} label="Recovered" value={recovered.length} color="#0f766e" tone={recovered.length ? "text-[#0f766e]" : "text-[#A6AABF]"} />
-        <StatChip icon={Tags} label="Unique reasons" value={reasons.length} color="#72748A" tone="text-[#25263A]" />
+        <StatChip icon={Ban} label="Unresolved" value={summary.dlqUnresolved} color="#e11d48" tone="text-rose-600" />
+        <StatChip icon={LifeBuoy} label="Recovered" value={summary.dlqRecovered} color="#0f766e" tone={summary.dlqRecovered ? "text-[#0f766e]" : "text-[#A6AABF]"} />
+        <StatChip icon={Tags} label="Unique reasons" value={Object.keys(summary.dlqReasons).length} color="#72748A" tone="text-[#25263A]" />
         <StatChip
           icon={History}
           label="Replay attempts"
@@ -302,17 +350,19 @@ export default function Dlq() {
         />
       </div>
 
-      {reasons.length > 0 && (
+      {Object.keys(summary.dlqReasons).length > 0 && (
         <div className="mb-5 flex flex-wrap items-center gap-1.5">
-          {reasons.map(([reason, count]) => (
-            <Badge
-              key={reason}
-              variant={isBenignReason(reason) ? "outline" : "destructive"}
-              className="font-mono text-[11px]"
-            >
-              {reason} · {count}
-            </Badge>
-          ))}
+          {Object.entries(summary.dlqReasons)
+            .sort((a, b) => b[1] - a[1])
+            .map(([reason, count]) => (
+              <Badge
+                key={reason}
+                variant={isBenignReason(reason) ? "outline" : "destructive"}
+                className="font-mono text-[11px]"
+              >
+                {reason} · {count}
+              </Badge>
+            ))}
         </div>
       )}
 
@@ -345,8 +395,14 @@ export default function Dlq() {
           <span className="text-xs text-muted-foreground">
             {selected.length > 0
               ? `${selected.length} selected`
-              : `No selection — targeting all ${unresolved.length} unresolved record${unresolved.length === 1 ? "" : "s"}`}
+              : `No selection — targeting the ${unresolved.length} unresolved record${unresolved.length === 1 ? "" : "s"} loaded here`}
           </span>
+          {queueTruncated && (
+            <span className="text-xs text-muted-foreground">
+              {summary.rejected.toLocaleString()} records in the queue; only the first{" "}
+              {PAGE_SIZE} are loaded. Tick the ones you mean.
+            </span>
+          )}
           {selected.length > 0 && (
             <Button variant="ghost" size="sm" onClick={() => setSelected([])}>
               Clear selection
@@ -460,16 +516,27 @@ export default function Dlq() {
                         </p>
                       )}
                     </div>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="shrink-0"
-                      disabled={busy !== false}
-                      onClick={() => void startRun([r.dlq_id])}
-                    >
-                      <RefreshCcw className="h-3.5 w-3.5" />
-                      Reprocess
-                    </Button>
+                    <div className="flex shrink-0 flex-col gap-1.5">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={busy !== false}
+                        onClick={() => void startRun([r.dlq_id])}
+                      >
+                        <RefreshCcw className="h-3.5 w-3.5" />
+                        Reprocess
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="text-muted-foreground hover:text-rose-600"
+                        disabled={busy !== false}
+                        onClick={() => void removeRecord(r.dlq_id)}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                        Remove
+                      </Button>
+                    </div>
                   </div>
                 </div>
               );

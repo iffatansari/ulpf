@@ -1,51 +1,70 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { ArrowRight, Ban, CheckCircle2, FileCode2, Layers, PlayCircle, TrendingUp } from "lucide-react";
+import { ArrowRight, Ban, CheckCircle2, FileCode2, Layers, LifeBuoy, PlayCircle, TrendingUp } from "lucide-react";
 import { CartesianGrid, Cell, ResponsiveContainer, Bar, BarChart, Legend, Pie, PieChart, Tooltip, XAxis, YAxis } from "recharts";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { PageHeader, StatChip } from "@/components/common/bits";
-import { isEvent } from "@/lib/guards";
-import { SEVERITY } from "@/lib/ocsf";
 import { useNormalizer } from "@/lib/normalize-context";
+import { formatFeedMetric, useNormalizedFeed } from "@/lib/normalized-feed";
 
 const SEV_COLORS = ["#cbd5e1", "#7dd3fc", "#34d399", "#fbbf24", "#fb923c", "#f43f5e", "#dc2626"];
 const CLASS_COLORS = ["#60a5fa", "#34d399", "#fbbf24", "#f472b6", "#a78bfa", "#22d3ee", "#f87171", "#a3e635", "#38bdf8", "#e879f9", "#facc15", "#2dd4bf"];
 
 export default function Metrics() {
-  const { result, loading, runSample } = useNormalizer();
+  // Same feed the Dashboard, Normalized events, Sources and DLQ pages read.
+  // Every number here is an OpenSearch aggregation served by /stats, so the
+  // charts describe the whole corpus rather than the 50-row window the
+  // browser happens to hold -- and no chart can quietly disagree with the
+  // chip above it.
+  const { summary, hasData } = useNormalizedFeed();
+  const { loading, runSample } = useNormalizer();
   const [severityOf, setSeverityOf] = useState<"events" | "accepted">("accepted");
 
-  const byClass = useMemo(() => {
-    if (!result) return [];
-    return Object.entries(result.summary.by_class)
-      .sort((a, b) => b[1] - a[1])
-      .map(([name, value], i) => ({ name, value, color: CLASS_COLORS[i % CLASS_COLORS.length] }));
-  }, [result]);
+  const byClass = useMemo(
+    () =>
+      Object.entries(summary.byClass)
+        .sort((a, b) => b[1] - a[1])
+        .map(([name, value], i) => ({ name, value, color: CLASS_COLORS[i % CLASS_COLORS.length] })),
+    [summary],
+  );
 
-  const byFormat = useMemo(() => {
-    if (!result) return [];
-    return Object.entries(result.summary.by_format)
-      .sort((a, b) => b[1] - a[1])
-      .map(([name, value]) => ({ name, value }));
-  }, [result]);
+  const byFormat = useMemo(
+    () =>
+      Object.entries(summary.byFormat)
+        .sort((a, b) => b[1] - a[1])
+        .map(([name, value]) => ({ name, value })),
+    [summary],
+  );
 
   const severityData = useMemo(() => {
-    if (!result) return [];
-    const counts = new Map<string, number>();
-    result.lines.forEach((l) => {
-      if (!isEvent(l)) return;
-      const sev = l.event.severity_id ?? 0;
-      const label = SEVERITY[sev] ?? "Other";
-      if (severityOf === "events" || sev > 0) counts.set(label, (counts.get(label) ?? 0) + 1);
-    });
-    return [...counts.entries()]
+    const entries = Object.entries(summary.bySeverity);
+    if (severityOf === "events") {
+      return entries
+        .sort((a, b) => b[1] - a[1])
+        .map(([name, value], i) => ({
+          name,
+          value,
+          color: SEV_COLORS[i % SEV_COLORS.length],
+        }));
+    }
+    // "Leveled events" means severity > 0. The old filter was
+    // `severity_id > 0` over the browser's copy of the OCSF event, which
+    // mapped the string "low" to 2 and anything unmapped to 0 -- so a
+    // drain3 event, whose severity is exactly "low", counted while the
+    // same event counted again under "all events" for no stated reason.
+    return entries
+      .filter(([name]) => name.toLowerCase() !== "none" && name !== "")
       .sort((a, b) => b[1] - a[1])
-      .map(([name, value], i) => ({ name, value, color: SEV_COLORS[i % SEV_COLORS.length] }));
-  }, [result, severityOf]);
+      .map(([name, value], i) => ({
+        name,
+        value,
+        color: SEV_COLORS[i % SEV_COLORS.length],
+      }));
+  }, [summary, severityOf]);
 
-  const accepted = result ? result.summary.events : 0;
-  const rejected = result ? result.summary.rejected : 0;
+  const accepted = summary.events;
+  const rejected = summary.rejected;
   const outcomeData = useMemo(
     () => [
       { name: "Accepted", value: accepted, color: "#34d399" },
@@ -54,7 +73,7 @@ export default function Metrics() {
     [accepted, rejected],
   );
 
-  if (!result) {
+  if (!hasData) {
     return (
       <>
         <PageHeader eyebrow="Monitoring · Metrics" title="Metrics" subtitle="Ingestion statistics from the definition of done: real events in, noise quarantined.">
@@ -80,16 +99,23 @@ export default function Metrics() {
       <PageHeader
         eyebrow="Monitoring · Metrics"
         title="Metrics"
-        subtitle={`Distribution of the last ingestion · ${result.summary.total_lines.toLocaleString()} input lines.`}
+        subtitle={`Whole-corpus distribution · ${formatFeedMetric(summary.totalLines)} input lines, ${accepted.toLocaleString()} accepted, ${rejected.toLocaleString()} rejected.`}
       >
         <Badge variant="outline" className="font-mono text-[11px]">
-          source: {result.summary.source_format}
+          source: {summary.sourceFormat}
         </Badge>
       </PageHeader>
 
-      <div className="mb-5 grid grid-cols-2 gap-2 sm:grid-cols-4">
+      <div className="mb-5 grid grid-cols-2 gap-2 sm:grid-cols-5">
         <StatChip icon={CheckCircle2} label="Accepted" value={accepted} color="#2f8ce0" tone="text-emerald-600" />
         <StatChip icon={Ban} label="Rejected" value={rejected} color="#e11d48" tone="text-rose-600" />
+        <StatChip
+          icon={LifeBuoy}
+          label="Rescued"
+          value={summary.rescued ?? 0}
+          color="#7c4dcc"
+          tone={summary.rescued ? "text-[#25263A]" : "text-[#A6AABF]"}
+        />
         <StatChip icon={Layers} label="Classes" value={byClass.length} color="#7c4dcc" tone="text-[#25263A]" />
         <StatChip icon={FileCode2} label="Formats" value={byFormat.length} color="#0f766e" tone="text-[#25263A]" />
       </div>
@@ -100,7 +126,7 @@ export default function Metrics() {
             <TrendingUp className="h-4 w-4 text-[#2f8ce0]" />
             Events by class
           </h3>
-          <p className="mb-3 text-xs text-muted-foreground">Counts from summary.by_class — the OCSF class_uid assigned to each accepted line.</p>
+          <p className="mb-3 text-xs text-muted-foreground">Counts mirror the Normalized events page — one feed, one source of truth.</p>
           <div className="h-64">
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={byClass} layout="vertical" margin={{ left: 8, right: 16 }}>
@@ -153,16 +179,16 @@ export default function Metrics() {
 
         <div className="rounded-lg border border-border bg-card p-4">
           <div className="mb-1 flex items-center justify-between gap-2">
-            <h3 className="flex items-center gap-2 text-sm font-bold">
-              <TrendingUp className="h-4 w-4 text-[#2f8ce0]" />
-              Severity by {severityOf === "accepted" ? "leveled events" : "all events"}
-            </h3>
+              <h3 className="flex items-center gap-2 text-sm font-bold">
+                <TrendingUp className="h-4 w-4 text-[#2f8ce0]" />
+                Severity by {severityOf === "accepted" ? "leveled events" : "all events"}
+              </h3>
             <select
               value={severityOf}
               onChange={(e) => setSeverityOf(e.target.value as "events" | "accepted")}
               className="h-7 rounded-md border border-border bg-card px-2 font-mono text-[11px] text-muted-foreground"
             >
-              <option value="accepted">{`only severity > 0`}</option>
+              <option value="accepted">{`only a named severity`}</option>
               <option value="events">all events</option>
             </select>
           </div>
