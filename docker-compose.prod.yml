@@ -1,0 +1,105 @@
+# Production overlay for a single Docker host.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# The base file is tuned for local development and is left untouched; every
+# deployment concern lives here. The only public entry point is `ui` on :3000 --
+# Express serves the SPA and proxies /backend to FastAPI, so the browser makes
+# same-origin calls and CORS never applies to the UI itself.
+#
+# Nothing here is required to run locally. It is the difference between "works
+# on my machine" and "survives a host reboot without filling the disk".
+
+services:
+  # ---------------------------------------------------------------------------
+  # OpenSearch is the only stateful thing that really matters. It holds Bronze,
+  # Silver, DLQ, sources, uploads and reprocess runs, and it is the service most
+  # likely to be OOM-killed on a small host.
+  # ---------------------------------------------------------------------------
+  opensearch:
+    restart: unless-stopped
+    environment:
+      # The base file hardcodes a 512m heap. That is the single most useful
+      # number to raise or lower for the host you deploy to.
+      OPENSEARCH_JAVA_OPTS: "-Xms${OPENSEARCH_HEAP:-512m} -Xmx${OPENSEARCH_HEAP:-512m}"
+    mem_limit: ${OPENSEARCH_MEM_LIMIT:-1500m}
+    pids_limit: 512
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+  # ---------------------------------------------------------------------------
+  # Redpanda. Binds PLAINTEXT with no auth, so it must never be reachable from
+  # the internet -- the base file already binds it to loopback, and this pins
+  # that so a later edit to the base file cannot expose the broker by accident.
+  # ---------------------------------------------------------------------------
+  redpanda:
+    restart: unless-stopped
+    ports: !override
+      - "127.0.0.1:9092:9092"
+
+  # ---------------------------------------------------------------------------
+  # FastAPI. Stays on loopback: the UI proxies to it over the compose network,
+  # and nothing needs to reach it from outside.
+  # ---------------------------------------------------------------------------
+  api:
+    restart: unless-stopped
+    environment:
+      # Moot while the UI is same-origin, but it is the value that silently
+      # breaks the moment anyone points a browser at the API directly.
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+    # The base file mounts ${PWD:-.}/data/uploads. PWD is a shell variable, so
+    # it is unset under systemd, in CI, and in most orchestrators -- the bind
+    # then resolves somewhere unexpected and uploads vanish. This is a plain
+    # relative path that Compose resolves against the project directory.
+    volumes: !override
+      - ${ULPF_DATA_DIR:-./data}/uploads:/data/uploads
+    mem_limit: ${API_MEM_LIMIT:-512m}
+
+  # ---------------------------------------------------------------------------
+  # File collector. No published port at all -- the API reaches it over the
+  # compose network, which is the only caller it has.
+  # ---------------------------------------------------------------------------
+  file_collector:
+    restart: unless-stopped
+    volumes: !override
+      - ${ULPF_DATA_DIR:-./data}/uploads:/data/uploads
+    mem_limit: ${FILE_COLLECTOR_MEM_LIMIT:-512m}
+
+  orchestrator:
+    restart: unless-stopped
+    mem_limit: ${ORCHESTRATOR_MEM_LIMIT:-512m}
+
+  # ---------------------------------------------------------------------------
+  # Ingestion endpoints. These accept unauthenticated writes, so on a public
+  # host they default to loopback. To accept logs from outside, bind them to
+  # 0.0.0.0 deliberately -- preferably behind a firewall or a token check --
+  # rather than by editing the base file and forgetting why.
+  # ---------------------------------------------------------------------------
+  http_json_collector:
+    restart: unless-stopped
+    ports: !override
+      - "${INGEST_BIND_ADDR:-127.0.0.1}:8081:8081"
+
+  syslog_collector:
+    restart: unless-stopped
+    ports: !override
+      - "${INGEST_BIND_ADDR:-127.0.0.1}:1514:1514/udp"
+      - "${INGEST_BIND_ADDR:-127.0.0.1}:5151:5151/tcp"
+
+  # ---------------------------------------------------------------------------
+  # The one container meant to face the internet. It serves static assets and
+  # proxies /backend, so the SPA and the API share an origin and the browser
+  # never makes a cross-origin request.
+  # ---------------------------------------------------------------------------
+  ui:
+    restart: unless-stopped
+    ports: !override
+      - "${UI_BIND_ADDR:-0.0.0.0}:${UI_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/api/ping').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
