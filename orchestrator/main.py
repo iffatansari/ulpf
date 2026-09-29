@@ -15,6 +15,7 @@ from parsers.cef_parser import parse_cef_log
 from parsers.json_parser import parse_json_log
 from parsers.syslog_parser import parse_syslog
 from parsers.drain_fallback import PARSER_ID as DRAIN3_PARSER_ID, parse_drain
+from parsers import custom_chain
 
 from dlq.reprocess import (
     HEADER_REPROCESS_ID,
@@ -217,6 +218,53 @@ def try_parser(
         return None, parser_id
 
 
+def _try_custom_parsers(
+    raw_event: RawEventEnvelope,
+    parsers_attempted: list[str],
+    opensearch: Optional[OpenSearch] = None,
+) -> Optional[NormalizedEvent]:
+    """
+    Give registered custom parsers their turn, before the Drain3 tier.
+
+    A custom parser is registered for a vendor format the built-ins do not
+    know, so it runs only once they have all declined -- and it runs before
+    Drain3, because Drain3 would otherwise claim the same line and label it by
+    template, which is indistinguishable, to the operator who just registered a
+    parser, from the parser not working at all.
+
+    A registry that cannot be read is not an error here: the built-in chain has
+    already had its turn, and Drain3 still follows.
+    """
+
+    try:
+        parsers = custom_chain.custom_parsers(opensearch)
+    except Exception as exc:
+        print(f"Custom parser tier unavailable: {exc}", flush=True)
+        return None
+
+    for parser_id, parser in parsers:
+
+        normalized, attempted_parser_id = try_parser(
+            parser,
+            parser_id,
+            raw_event,
+        )
+
+        parsers_attempted.append(attempted_parser_id)
+
+        if normalized is not None:
+
+            print(
+                f"Recovered via custom parser {attempted_parser_id} "
+                f"for event {raw_event.event_id}",
+                flush=True,
+            )
+
+            return normalized
+
+    return None
+
+
 def _try_drain_fallback(
     raw_event: RawEventEnvelope,
     parsers_attempted: list[str],
@@ -247,29 +295,36 @@ def _try_drain_fallback(
 
 def normalize_raw_event(
     raw_event: RawEventEnvelope,
+    opensearch: Optional[OpenSearch] = None,
 ) -> tuple[Optional[NormalizedEvent], list[str]]:
     """
     Decide which parser(s) should be tried.
 
     A format hint is a PREFERENCE, not a commitment. When the hinted parser
     parses the line, it wins and the fallback is never touched. When it
-    declines, the Drain3 tier still gets a turn before anything is rejected,
-    because a hint that no longer matches the traffic (a source reconfigured,
-    a vendor changing its format, a truncated write) used to dead-end
-    straight into the DLQ even though the fallback existed precisely to catch
-    "no dedicated parser matched".
+    declines, the remaining tiers still get a turn before anything is
+    rejected, because a hint that no longer matches the traffic (a source
+    reconfigured, a vendor changing its format, a truncated write) used to
+    dead-end straight into the DLQ even though the fallback existed precisely
+    to catch "no dedicated parser matched".
 
     That distinction matters: every event minted as a DLQ record is work an
     operator has to triage and replay, so the chain should only reject once
-    the fallback has also had its turn.
+    every tier -- including the custom parsers an operator registered for this
+    very traffic -- has had its turn.
 
     Known format:
-        Use the corresponding parser, then Drain3 if it declines.
+        Use the corresponding parser, then the custom tier, then Drain3.
 
     Unknown format:
         Probe all known parsers until one successfully
-        produces a valid NormalizedEvent, then try the
-        Drain3 fallback tier.
+        produces a valid NormalizedEvent, then the custom
+        tier, then the Drain3 fallback tier.
+
+    `opensearch` is threaded in by the consumer loop so the custom tier can
+    read the registry over the connection the process already holds. It is
+    optional because the other caller, the API's DLQ dry run, has no client to
+    offer and lets the tier open its own.
     """
 
     parsers_attempted = []
@@ -298,6 +353,10 @@ def normalize_raw_event(
             return normalized, parsers_attempted
 
         # Declined. Fall through rather than reject.
+        recovered = _try_custom_parsers(raw_event, parsers_attempted, opensearch)
+        if recovered is not None:
+            return recovered, parsers_attempted
+
         return _try_drain_fallback(raw_event, parsers_attempted), parsers_attempted
 
     # ---------------------------------------------------------
@@ -305,8 +364,8 @@ def normalize_raw_event(
     #
     # Do NOT use transport to decide the parser.
     #
-    # Probe all known parsers, then fall through to the Drain3
-    # fallback tier.
+    # Probe all known parsers, then fall through to the custom
+    # tier and the Drain3 fallback tier.
     #
     # This deliberately covers every hint that is not cef/json/
     # syslog -- "unknown", but also "auto", "raw", "text", "leef",
@@ -336,6 +395,10 @@ def normalize_raw_event(
             )
 
             return normalized, parsers_attempted
+
+    recovered = _try_custom_parsers(raw_event, parsers_attempted, opensearch)
+    if recovered is not None:
+        return recovered, parsers_attempted
 
     return _try_drain_fallback(raw_event, parsers_attempted), parsers_attempted
 
@@ -535,7 +598,8 @@ async def main():
                 )
 
                 normalized, parsers_attempted = normalize_raw_event(
-                    raw_event
+                    raw_event,
+                    opensearch,
                 )
 
                 # -------------------------------------------------

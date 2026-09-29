@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
+import { Switch } from "@/components/ui/switch";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { PageHeader } from "@/components/common/bits";
 import {
@@ -12,6 +13,7 @@ import {
   deleteBackendParser,
   listBackendParsers,
   testBackendParser,
+  updateBackendParser,
   type BackendParserDoc,
   type BackendParserTestResult,
 } from "@/lib/backend";
@@ -21,10 +23,22 @@ import {
  * and not a browser-side regex. Testing goes through POST /parsers/test so the
  * answer comes from the server's copy of the same rules; what the browser
  * extracted on its own was never evidence the pipeline would parse anything.
+ *
+ * Registering and activating are two steps on purpose. A parser is created as
+ * a draft so a half-written rule set never starts consuming traffic the moment
+ * it is saved, and the switch is what puts it in the chain. The status is shown
+ * on every card because "registered" and "parsing" are different states and the
+ * card used to look the same in both.
  */
 
 const DEFAULT_SAMPLE =
   'time="2024-01-22T12:42:48Z" level="error" msg="request failed" err="connection refused" ref="http/ingress"';
+
+const STATUS_BADGE: Record<string, { label: string; className: string }> = {
+  active: { label: "In chain", className: "border-emerald-500/50 text-emerald-600" },
+  draft: { label: "Draft — not in chain", className: "border-amber-500/50 text-amber-600" },
+  disabled: { label: "Disabled", className: "border-border text-muted-foreground" },
+};
 
 function slugify(name: string): string {
   return name
@@ -41,6 +55,7 @@ export default function CustomParsers() {
   const [keysInput, setKeysInput] = useState("");
   const [sample, setSample] = useState(DEFAULT_SAMPLE);
   const [busy, setBusy] = useState(false);
+  const [saving, setSaving] = useState<string | null>(null);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [result, setResult] = useState<BackendParserTestResult | null>(null);
   const [resultName, setResultName] = useState<string | null>(null);
@@ -98,6 +113,27 @@ export default function CustomParsers() {
     }
   };
 
+  const setStatus = async (parser: BackendParserDoc, active: boolean) => {
+    setSaving(parser.parser_id);
+    try {
+      const updated = await updateBackendParser(parser.parser_id, {
+        status: active ? "active" : "disabled",
+      });
+      setParsers((prev) =>
+        prev ? prev.map((p) => (p.parser_id === updated.parser_id ? updated : p)) : prev,
+      );
+      toast.success(
+        active
+          ? `${updated.display_name} is now in the chain`
+          : `${updated.display_name} was taken out of the chain`,
+      );
+    } catch {
+      toast.error(`Could not update ${parser.display_name}`);
+    } finally {
+      setSaving(null);
+    }
+  };
+
   const remove = async (parser: BackendParserDoc) => {
     try {
       await deleteBackendParser(parser.parser_id);
@@ -152,6 +188,16 @@ export default function CustomParsers() {
                         {p.display_name}
                       </CardTitle>
                       <div className="flex items-center gap-1.5">
+                        <Switch
+                          checked={p.status === "active"}
+                          disabled={saving === p.parser_id}
+                          onCheckedChange={(v) => void setStatus(p, v)}
+                          title={
+                            p.status === "active"
+                              ? "Take this parser out of the chain"
+                              : "Put this parser in the chain"
+                          }
+                        />
                         <Button
                           variant="outline"
                           size="sm"
@@ -176,7 +222,17 @@ export default function CustomParsers() {
                         </Button>
                       </div>
                     </div>
-                    <CardDescription className="font-mono text-[11px]">{p.parser_id}</CardDescription>
+                    <div className="flex items-center gap-2">
+                      <CardDescription className="font-mono text-[11px]">{p.parser_id}</CardDescription>
+                      <Badge
+                        variant="outline"
+                        className={`text-[10px] ${
+                          (STATUS_BADGE[p.status] ?? STATUS_BADGE.disabled).className
+                        }`}
+                      >
+                        {(STATUS_BADGE[p.status] ?? STATUS_BADGE.disabled).label}
+                      </Badge>
+                    </div>
                     <div className="flex flex-wrap gap-1">
                       {(p.field_rules ?? []).map((r) => (
                         <Badge key={r.name} variant="secondary" className="font-mono text-[10px]">
@@ -200,6 +256,13 @@ export default function CustomParsers() {
               )}
             </div>
 
+            {custom.some((p) => p.status !== "active") && (
+              <p className="mt-3 text-xs text-muted-foreground">
+                Parsers that are not <span className="font-medium">In chain</span> are stored but
+                not tried against live traffic.
+              </p>
+            )}
+
             {builtins.length > 0 && (
               <p className="mt-3 text-xs text-muted-foreground">
                 {builtins.length} built-in parsers are also registered
@@ -216,7 +279,8 @@ export default function CustomParsers() {
                 </CardTitle>
                 <CardDescription>
                   Field keys become name=value rules; quoted and space-separated values are both
-                  matched.
+                  matched. A new parser is saved as a draft — flip its switch once the sample line
+                  extracts what you expect.
                 </CardDescription>
               </CardHeader>
               <CardContent className="p-4 pt-2">

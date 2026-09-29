@@ -43,6 +43,17 @@ router = APIRouter()
 # grow a document without limit.
 MAX_HISTORY = 10
 
+# Every write in this module waits for the next index refresh.
+#
+# OpenSearch is near-real-time: an indexed document is invisible to `search`
+# until the next refresh (1s by default). The registry is read through
+# `search` (list_parsers), so without this an operator who registers a parser
+# and then reloads the page sees the old list -- the write succeeded and the
+# UI reports "gone". A registration that cannot be read back is not a
+# registration, and the parser registry is a low-QPS control surface, so
+# blocking on the refresh costs nothing and makes write-then-read honest.
+REFRESH = "wait_for"
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -88,6 +99,7 @@ def ensure_builtin_parsers(es: Optional[OpenSearch] = None) -> None:
             index=PARSERS_INDEX,
             id=parser_id,
             body=jsonable(record.model_dump()),
+            refresh=REFRESH,
         )
 
 
@@ -177,7 +189,7 @@ def create_parser(payload: ParserCreate, es: Optional[OpenSearch] = None) -> Dic
         created_by=payload.created_by,
     )
     body = jsonable(record.model_dump())
-    client.index(index=PARSERS_INDEX, id=payload.parser_id, body=body)
+    client.index(index=PARSERS_INDEX, id=payload.parser_id, body=body, refresh=REFRESH)
     return _serialize(body)
 
 
@@ -223,7 +235,7 @@ def update_parser(
     history = history[-MAX_HISTORY:]
 
     updated = {**current, **changes, "history": history, "updated_at": _now()}
-    client.index(index=PARSERS_INDEX, id=parser_id, body=jsonable(updated))
+    client.index(index=PARSERS_INDEX, id=parser_id, body=jsonable(updated), refresh=REFRESH)
     return _serialize(updated)
 
 
@@ -252,7 +264,7 @@ def rollback_parser(
         "version": int(current.get("version", 1)) + 1,
         "updated_at": _now(),
     }
-    client.index(index=PARSERS_INDEX, id=parser_id, body=jsonable(restored))
+    client.index(index=PARSERS_INDEX, id=parser_id, body=jsonable(restored), refresh=REFRESH)
     return _serialize(restored)
 
 
@@ -276,7 +288,7 @@ def delete_parser(parser_id: str, es: Optional[OpenSearch] = None) -> Dict[str, 
                 "of deleting it"
             ),
         )
-    client.delete(index=PARSERS_INDEX, id=parser_id)
+    client.delete(index=PARSERS_INDEX, id=parser_id, refresh=REFRESH)
     return {"deleted": parser_id}
 
 
@@ -371,6 +383,7 @@ def _record_test(
             index=PARSERS_INDEX,
             id=parser_id,
             body={"doc": {"last_test": {**result, "tested_at": _now()}}},
+            refresh=REFRESH,
         )
     except Exception:
         # A failed bookkeeping write must not fail the test itself.
