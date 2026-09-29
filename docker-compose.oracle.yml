@@ -1,0 +1,71 @@
+# Oracle Always Free overlay.
+#
+#   docker compose --env-file deploy/oracle/env.oracle \
+#     -f docker-compose.yml -f docker-compose.prod.yml \
+#     -f docker-compose.oracle.yml up -d --build
+#
+# The Always Free Ampere A1 shape is 2 OCPU / 12 GB. That is the whole budget,
+# so this file exists to make the total explicit and enforceable instead of
+# letting any single container grow into the host's swap.
+#
+# Note the advertised address for the internal listener stays
+# PLAINTEXT://redpanda:29092, because every in-network client is configured
+# with REDPANDA_BROKER=redpanda:29092. Only the host-side port moves to
+# loopback, which the prod overlay already handles.
+
+services:
+  # ---------------------------------------------------------------------------
+  # OpenSearch gets the largest single share. Heap is 2 GB inside a 3 GB limit:
+  # OpenSearch needs roughly 50% headroom above the heap for Lucene off-heap
+  # structures, and going over the limit turns a slow query into an OOM kill of
+  # the whole node.
+  # ---------------------------------------------------------------------------
+  opensearch:
+    environment:
+      OPENSEARCH_JAVA_OPTS: "-Xms${ORACLE_OPENSEARCH_HEAP:-2g} -Xmx${ORACLE_OPENSEARCH_HEAP:-2g}"
+    mem_limit: ${ORACLE_OPENSEARCH_MEM_LIMIT:-3072m}
+    mem_reservation: ${ORACLE_OPENSEARCH_MEM_LIMIT:-3072m}
+
+  # ---------------------------------------------------------------------------
+  # Redpanda otherwise defaults to 25% of host RAM, which is 3 GB on a 12 GB
+  # box and is more than it needs here. Pin it explicitly so the number is
+  # visible in the compose file rather than derived from the host at runtime.
+  # ---------------------------------------------------------------------------
+  redpanda:
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --overprovisioned
+      - --node-id=0
+      - --memory=${ORACLE_REDPANDA_MEM:-2G}
+      - --reserve-memory=0M
+      - --kafka-addr
+      - PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
+      - --advertise-kafka-addr
+      - PLAINTEXT://redpanda:29092,OUTSIDE://localhost:9092
+    mem_limit: ${ORACLE_REDPANDA_MEM_LIMIT:-2560m}
+    mem_reservation: ${ORACLE_REDPANDA_MEM_LIMIT:-2560m}
+
+  # ---------------------------------------------------------------------------
+  # Application services. Together these are ~3 GB. The API and the
+  # orchestrator are the two that do real work (OpenSearch queries and Kafka
+  # consumption), so they get the larger share; the rest are I/O bound.
+  # ---------------------------------------------------------------------------
+  api:
+    mem_limit: ${ORACLE_API_MEM_LIMIT:-768m}
+
+  orchestrator:
+    mem_limit: ${ORACLE_ORCHESTRATOR_MEM_LIMIT:-768m}
+
+  file_collector:
+    mem_limit: ${ORACLE_FILE_COLLECTOR_MEM_LIMIT:-512m}
+
+  http_json_collector:
+    mem_limit: ${ORACLE_INGEST_MEM_LIMIT:-512m}
+
+  syslog_collector:
+    mem_limit: ${ORACLE_SYSLOG_MEM_LIMIT:-256m}
+
+  ui:
+    mem_limit: ${ORACLE_UI_MEM_LIMIT:-512m}
